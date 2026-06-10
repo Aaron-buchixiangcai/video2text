@@ -32,7 +32,11 @@ enum SmokeTest {
                 language = value == "auto" ? nil : value
             case "--diarize": diarize = true
             case "--words": break
-            case "--url": remoteURL = it.next()
+            case "--extract-url":
+                print(LinkExtractor.bestEffortURLString(from: it.next() ?? ""))
+                exit(0)
+            case "--url":
+                remoteURL = it.next().map { LinkExtractor.bestEffortURLString(from: $0) }
             default: files.append(arg)
             }
         }

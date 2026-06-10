@@ -25,9 +25,9 @@ final class AppState: ObservableObject {
     }
 
     func submit(urlString: String) {
-        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        let task = TranscriptionTask(source: .remote(trimmed))
+        let extracted = LinkExtractor.bestEffortURLString(from: urlString)
+        guard !extracted.isEmpty else { return }
+        let task = TranscriptionTask(source: .remote(extracted))
         enqueue(task)
     }
 
