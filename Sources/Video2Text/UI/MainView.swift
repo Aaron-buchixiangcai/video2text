@@ -13,9 +13,9 @@ struct MainView: View {
                 .navigationSplitViewColumnWidth(min: 220, ideal: 260)
         } detail: {
             detail
-        }
-        .safeAreaInset(edge: .top, spacing: 0) {
-            inputBar
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    inputBar
+                }
         }
         .dropDestination(for: URL.self) { urls, _ in
             let mediaURLs = urls.filter { $0.isFileURL }
