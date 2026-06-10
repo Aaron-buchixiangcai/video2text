@@ -63,10 +63,17 @@ struct TranscriptView: View {
                 Label(copied ? "已复制" : "复制", systemImage: copied ? "checkmark" : "doc.on.doc")
             }
 
-            Button {
-                TranscriptExporter.exportWithPanel(
-                    transcript, diarized: diarized, suggestedName: title
-                )
+            Menu {
+                ForEach(ExportFileType.allCases) { type in
+                    Button(type.rawValue) {
+                        TranscriptExporter.exportWithPanel(
+                            transcript,
+                            type: type,
+                            diarized: diarized,
+                            suggestedName: title
+                        )
+                    }
+                }
             } label: {
                 Label("导出…", systemImage: "square.and.arrow.up")
             }

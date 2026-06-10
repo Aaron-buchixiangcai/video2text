@@ -13,6 +13,7 @@ enum TranscriptFormat: String, CaseIterable, Identifiable {
 enum ExportFileType: String, CaseIterable, Identifiable {
     case txt = "文本 (.txt)"
     case srt = "字幕 (.srt)"
+    case vtt = "字幕 (.vtt)"
     case markdown = "Markdown (.md)"
 
     var id: String { rawValue }
@@ -21,8 +22,13 @@ enum ExportFileType: String, CaseIterable, Identifiable {
         switch self {
         case .txt: return "txt"
         case .srt: return "srt"
+        case .vtt: return "vtt"
         case .markdown: return "md"
         }
+    }
+
+    var contentType: UTType {
+        UTType(filenameExtension: fileExtension) ?? .plainText
     }
 }
 
@@ -49,6 +55,8 @@ enum TranscriptExporter {
             return render(transcript, format: diarized ? .diarized : .timestamped)
         case .srt:
             return srt(transcript, includeSpeaker: diarized)
+        case .vtt:
+            return vtt(transcript, includeSpeaker: diarized)
         case .markdown:
             return markdown(transcript, diarized: diarized)
         }
@@ -65,6 +73,19 @@ enum TranscriptExporter {
             \(speaker)\(u.text)
             """
         }.joined(separator: "\n\n") + "\n"
+    }
+
+    static func vtt(_ transcript: Transcript, includeSpeaker: Bool) -> String {
+        let cues = transcript.utterances.map { u in
+            let speaker = includeSpeaker
+                ? (u.speaker.map { "说话人\($0 + 1)：" } ?? "")
+                : ""
+            return """
+            \(vttTime(u.start)) --> \(vttTime(u.end))
+            \(speaker)\(u.text)
+            """
+        }.joined(separator: "\n\n")
+        return "WEBVTT\n\n" + cues + "\n"
     }
 
     static func markdown(_ transcript: Transcript, diarized: Bool) -> String {
@@ -90,21 +111,24 @@ enum TranscriptExporter {
 
     /// NSSavePanel 导出
     @MainActor
-    static func exportWithPanel(_ transcript: Transcript, diarized: Bool, suggestedName: String) {
+    static func exportWithPanel(
+        _ transcript: Transcript,
+        type: ExportFileType,
+        diarized: Bool,
+        suggestedName: String
+    ) {
         let panel = NSSavePanel()
         panel.canCreateDirectories = true
-        panel.nameFieldStringValue = sanitizeFileName(suggestedName)
-        panel.allowedContentTypes = [
-            UTType(filenameExtension: "txt")!,
-            UTType(filenameExtension: "srt") ?? .plainText,
-            UTType(filenameExtension: "md") ?? .plainText,
-        ]
+        panel.allowsOtherFileTypes = false
+        panel.isExtensionHidden = false
+        panel.nameFieldStringValue = sanitizedFileName(suggestedName, type: type)
+        panel.allowedContentTypes = [type.contentType]
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let type = ExportFileType.allCases.first {
-            $0.fileExtension == url.pathExtension.lowercased()
-        } ?? .txt
+        let outputURL = url.pathExtension.isEmpty
+            ? url.appendingPathExtension(type.fileExtension)
+            : url
         let content = renderFile(transcript, type: type, diarized: diarized)
-        try? content.write(to: url, atomically: true, encoding: .utf8)
+        try? content.write(to: outputURL, atomically: true, encoding: .utf8)
     }
 
     private static func srtTime(_ seconds: Double) -> String {
@@ -113,10 +137,16 @@ enum TranscriptExporter {
         return String(format: "%02d:%02d:%02d,%03d", total / 3600, (total % 3600) / 60, total % 60, ms)
     }
 
-    private static func sanitizeFileName(_ name: String) -> String {
+    private static func vttTime(_ seconds: Double) -> String {
+        let ms = Int((seconds.truncatingRemainder(dividingBy: 1)) * 1000)
+        let total = Int(seconds)
+        return String(format: "%02d:%02d:%02d.%03d", total / 3600, (total % 3600) / 60, total % 60, ms)
+    }
+
+    private static func sanitizedFileName(_ name: String, type: ExportFileType) -> String {
         let invalid = CharacterSet(charactersIn: "/\\:?%*|\"<>")
         let cleaned = name.components(separatedBy: invalid).joined(separator: "_")
         let trimmed = cleaned.trimmingCharacters(in: .whitespaces)
-        return (trimmed.isEmpty ? "文字稿" : String(trimmed.prefix(80))) + ".txt"
+        return (trimmed.isEmpty ? "文字稿" : String(trimmed.prefix(80))) + ".\(type.fileExtension)"
     }
 }
