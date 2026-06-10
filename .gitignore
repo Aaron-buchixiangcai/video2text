@@ -1,0 +1,26 @@
+.DS_Store
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Local assistant/editor state
+.claude/
+.codex/
+.agents/
+
+# Generated app bundles and packaged artifacts
+dist/
+*.app/
+*.dSYM/
+
+# Local media and export outputs
+*.mp4
+*.mov
+*.m4v
+*.m4a
+*.mp3
+*.wav
+*.aac
+*.flac
+*.srt
