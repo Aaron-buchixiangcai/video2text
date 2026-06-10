@@ -6,35 +6,33 @@ struct TranscriptView: View {
     let title: String
 
     @State private var format: TranscriptFormat = .plain
+    @State private var renderedText = ""
     @State private var copied = false
 
     private var availableFormats: [TranscriptFormat] {
         diarized ? TranscriptFormat.allCases : [.plain, .timestamped]
     }
 
-    private var renderedText: String {
-        TranscriptExporter.render(transcript, format: format)
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             toolbar
             Divider()
-            ScrollView {
-                Text(renderedText)
-                    .font(.body)
-                    .lineSpacing(5)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(16)
-            }
+            TranscriptTextView(text: renderedText)
         }
         .navigationTitle(title)
         .onAppear {
-            format = diarized ? .diarized : .plain
+            let initialFormat: TranscriptFormat = diarized ? .diarized : .plain
+            format = initialFormat
+            renderedText = TranscriptExporter.render(transcript, format: initialFormat)
+        }
+        .onChange(of: format) { _, newValue in
+            renderedText = TranscriptExporter.render(transcript, format: newValue)
         }
         .onChange(of: diarized) { _, newValue in
-            if newValue { format = .diarized }
+            if newValue {
+                format = .diarized
+                renderedText = TranscriptExporter.render(transcript, format: .diarized)
+            }
         }
     }
 

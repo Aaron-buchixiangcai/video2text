@@ -114,6 +114,7 @@ struct MainView: View {
         case let .task(id):
             if let task = appState.task(for: id) {
                 TaskDetailView(task: task)
+                    .id(task.id)
             } else {
                 placeholder
             }
@@ -124,6 +125,7 @@ struct MainView: View {
                     diarized: record.diarized,
                     title: record.title
                 )
+                .id(record.id)
             } else {
                 placeholder
             }
