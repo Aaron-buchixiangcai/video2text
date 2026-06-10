@@ -88,7 +88,7 @@ final class PipelineCoordinator: ObservableObject {
             try Task.checkCancellation()
 
             // 转写结果先展示（不带说话人）
-            let plain = Self.transcript(from: results)
+            let plain = Self.transcript(from: results).simplifiedChinese()
             task.transcript = plain
 
             // 5. 说话人分离（失败不影响已有转写结果）
@@ -99,7 +99,7 @@ final class PipelineCoordinator: ObservableObject {
                     let labeled = try await diarizer.diarizedTranscript(
                         audio: audio, transcription: results
                     )
-                    task.transcript = labeled.coalesced()
+                    task.transcript = labeled.coalesced().simplifiedChinese()
                     task.diarized = true
                 } catch is CancellationError {
                     throw CancellationError()

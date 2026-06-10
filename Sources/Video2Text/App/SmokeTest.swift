@@ -32,6 +32,9 @@ enum SmokeTest {
                 language = value == "auto" ? nil : value
             case "--diarize": diarize = true
             case "--words": break
+            case "--simplify-text":
+                print(TextNormalizer.simplifiedChinese(it.next() ?? ""))
+                exit(0)
             case "--extract-url":
                 print(LinkExtractor.bestEffortURLString(from: it.next() ?? ""))
                 exit(0)

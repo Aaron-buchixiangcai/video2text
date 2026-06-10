@@ -37,6 +37,18 @@ struct Transcript: Codable, Hashable {
         return Transcript(utterances: merged, language: language, speakerCount: speakerCount)
     }
 
+    func simplifiedChinese() -> Transcript {
+        Transcript(
+            utterances: utterances.map { utterance in
+                var normalized = utterance
+                normalized.text = TextNormalizer.simplifiedChinese(utterance.text)
+                return normalized
+            },
+            language: language,
+            speakerCount: speakerCount
+        )
+    }
+
     /// 中文之间直接拼接，英文之间补空格
     private func joinText(_ a: String, _ b: String) -> String {
         let lhs = a.trimmingCharacters(in: .whitespaces)
@@ -50,6 +62,12 @@ struct Transcript: Codable, Hashable {
             return lhs + rhs
         }
         return lhs + " " + rhs
+    }
+}
+
+enum TextNormalizer {
+    static func simplifiedChinese(_ text: String) -> String {
+        text.applyingTransform(StringTransform("Traditional-Simplified"), reverse: false) ?? text
     }
 }
 
