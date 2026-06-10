@@ -93,11 +93,28 @@ final class PipelineCoordinator: ObservableObject {
 
             // 5. 说话人分离（失败不影响已有转写结果）
             if settings.diarizationEnabled {
-                task.stage = .diarizing
+                task.stage = .diarizing(0)
                 do {
-                    try await diarizer.load(endpoint: settings.endpoint)
+                    try await diarizer.load(
+                        endpoint: settings.endpoint,
+                        downloadProgress: { progress in
+                            Task { @MainActor in
+                                if case .diarizing = task.stage {
+                                    task.stage = .diarizing(progress.fractionCompleted * 0.2)
+                                }
+                            }
+                        }
+                    )
                     let labeled = try await diarizer.diarizedTranscript(
-                        audio: audio, transcription: results
+                        audio: audio,
+                        transcription: results,
+                        progress: { fraction in
+                            Task { @MainActor in
+                                if case .diarizing = task.stage {
+                                    task.stage = .diarizing(0.2 + fraction * 0.8)
+                                }
+                            }
+                        }
                     )
                     task.transcript = labeled.coalesced().simplifiedChinese()
                     task.diarized = true

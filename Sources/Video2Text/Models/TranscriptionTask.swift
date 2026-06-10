@@ -18,7 +18,7 @@ enum TaskStage: Hashable {
     case extracting
     case loadingModel(Double)
     case transcribing(Double)
-    case diarizing
+    case diarizing(Double)
     case completed
     case failed(String)
     case cancelled
@@ -39,11 +39,17 @@ enum TaskStage: Hashable {
 
     var progress: Double? {
         switch self {
-        case let .downloading(p), let .loadingModel(p), let .transcribing(p):
+        case let .downloading(p), let .loadingModel(p), let .transcribing(p), let .diarizing(p):
             return p
         default:
             return nil
         }
+    }
+
+    var percentText: String? {
+        guard let progress else { return nil }
+        let clamped = min(1, max(0, progress))
+        return "\(Int((clamped * 100).rounded()))%"
     }
 
     var isFinished: Bool {

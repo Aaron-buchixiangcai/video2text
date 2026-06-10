@@ -13,6 +13,10 @@ struct TaskRowView: View {
                 if let progress = task.stage.progress {
                     ProgressView(value: progress)
                         .controlSize(.small)
+                        .frame(width: 54)
+                    Text(task.stage.percentText ?? "")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
                 } else if !task.stage.isFinished {
                     ProgressView()
                         .controlSize(.small)
@@ -53,7 +57,7 @@ struct TaskDetailView: View {
         if let transcript = task.transcript {
             VStack(spacing: 0) {
                 if case .diarizing = task.stage {
-                    banner("正在分离说话人，下方为初步文字稿…")
+                    banner("正在分离说话人，下方为初步文字稿…", progress: task.stage.progress)
                 }
                 TranscriptView(
                     transcript: transcript,
@@ -79,9 +83,8 @@ struct TaskDetailView: View {
                     Text("任务已取消")
                         .foregroundStyle(.secondary)
                 default:
-                    ProgressView(value: task.stage.progress)
-                        .progressViewStyle(.circular)
-                    Text(task.stage.label + progressSuffix)
+                    progressIndicator
+                    Text(task.stage.label)
                         .font(.headline)
                     Text(TitleFormatter.shortDisplay(task.title))
                         .font(.callout)
@@ -95,16 +98,34 @@ struct TaskDetailView: View {
         }
     }
 
-    private var progressSuffix: String {
-        if let p = task.stage.progress, p > 0 {
-            return "  \(Int(p * 100))%"
+    @ViewBuilder
+    private var progressIndicator: some View {
+        if let progress = task.stage.progress {
+            VStack(spacing: 8) {
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+                    .frame(width: 260)
+                Text(task.stage.percentText ?? "")
+                    .font(.title2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        } else {
+            ProgressView()
+                .progressViewStyle(.circular)
         }
-        return ""
     }
 
-    private func banner(_ text: String) -> some View {
+    private func banner(_ text: String, progress: Double?) -> some View {
         HStack(spacing: 6) {
-            ProgressView().controlSize(.small)
+            if let progress {
+                ProgressView(value: progress)
+                    .frame(width: 90)
+                Text(task.stage.percentText ?? "")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            } else {
+                ProgressView().controlSize(.small)
+            }
             Text(text).font(.callout)
             Spacer()
         }
