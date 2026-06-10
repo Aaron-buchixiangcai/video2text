@@ -5,7 +5,7 @@ struct TaskRowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(task.title)
+            Text(TitleFormatter.shortDisplay(task.title))
                 .lineLimit(1)
 
             HStack(spacing: 6) {
@@ -83,7 +83,7 @@ struct TaskDetailView: View {
                         .progressViewStyle(.circular)
                     Text(task.stage.label + progressSuffix)
                         .font(.headline)
-                    Text(task.title)
+                    Text(TitleFormatter.shortDisplay(task.title))
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)

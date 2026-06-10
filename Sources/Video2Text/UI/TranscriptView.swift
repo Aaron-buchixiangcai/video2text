@@ -19,7 +19,7 @@ struct TranscriptView: View {
             Divider()
             TranscriptTextView(text: renderedText)
         }
-        .navigationTitle(title)
+        .navigationTitle(TitleFormatter.shortDisplay(title))
         .onAppear {
             let initialFormat: TranscriptFormat = diarized ? .diarized : .plain
             format = initialFormat

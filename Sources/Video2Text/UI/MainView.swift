@@ -87,7 +87,7 @@ struct MainView: View {
                 Section("历史") {
                     ForEach(history.records) { record in
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(record.title)
+                            Text(TitleFormatter.shortDisplay(record.title))
                                 .lineLimit(1)
                             Text(record.date.formatted(date: .abbreviated, time: .shortened))
                                 .font(.caption)

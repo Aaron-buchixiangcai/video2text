@@ -38,6 +38,21 @@ enum SmokeTest {
             case "--extract-url":
                 print(LinkExtractor.bestEffortURLString(from: it.next() ?? ""))
                 exit(0)
+            case "--sample-docx":
+                let path = it.next() ?? "/tmp/video2text-sample.docx"
+                let sample = Transcript(utterances: [
+                    Utterance(speaker: 0, start: 1, end: 3, text: "这是第一句话。"),
+                    Utterance(speaker: 1, start: 4, end: 7, text: "这是第二句话。"),
+                ], language: "zh", speakerCount: 2)
+                let data = TranscriptExporter.exportData(
+                    sample,
+                    type: .docx,
+                    diarized: true,
+                    title: "这是一个非常长的视频标题需要缩短"
+                )
+                try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+                print(path)
+                exit(0)
             case "--url":
                 remoteURL = it.next().map { LinkExtractor.bestEffortURLString(from: $0) }
             default: files.append(arg)

@@ -12,6 +12,7 @@ enum TranscriptFormat: String, CaseIterable, Identifiable {
 
 enum ExportFileType: String, CaseIterable, Identifiable {
     case txt = "文本 (.txt)"
+    case docx = "Word (.docx)"
     case srt = "字幕 (.srt)"
     case vtt = "字幕 (.vtt)"
     case markdown = "Markdown (.md)"
@@ -21,6 +22,7 @@ enum ExportFileType: String, CaseIterable, Identifiable {
     var fileExtension: String {
         switch self {
         case .txt: return "txt"
+        case .docx: return "docx"
         case .srt: return "srt"
         case .vtt: return "vtt"
         case .markdown: return "md"
@@ -52,6 +54,8 @@ enum TranscriptExporter {
     static func renderFile(_ transcript: Transcript, type: ExportFileType, diarized: Bool) -> String {
         switch type {
         case .txt:
+            return render(transcript, format: diarized ? .diarized : .timestamped)
+        case .docx:
             return render(transcript, format: diarized ? .diarized : .timestamped)
         case .srt:
             return srt(transcript, includeSpeaker: diarized)
@@ -127,8 +131,20 @@ enum TranscriptExporter {
         let outputURL = url.pathExtension.isEmpty
             ? url.appendingPathExtension(type.fileExtension)
             : url
-        let content = renderFile(transcript, type: type, diarized: diarized)
-        try? content.write(to: outputURL, atomically: true, encoding: .utf8)
+        let data = exportData(transcript, type: type, diarized: diarized, title: suggestedName)
+        try? data.write(to: outputURL, options: .atomic)
+    }
+
+    static func exportData(
+        _ transcript: Transcript,
+        type: ExportFileType,
+        diarized: Bool,
+        title: String
+    ) -> Data {
+        if type == .docx {
+            return WordDocumentExporter.docxData(title: title, transcript: transcript, diarized: diarized)
+        }
+        return Data(renderFile(transcript, type: type, diarized: diarized).utf8)
     }
 
     private static func srtTime(_ seconds: Double) -> String {
@@ -147,6 +163,10 @@ enum TranscriptExporter {
         let invalid = CharacterSet(charactersIn: "/\\:?%*|\"<>")
         let cleaned = name.components(separatedBy: invalid).joined(separator: "_")
         let trimmed = cleaned.trimmingCharacters(in: .whitespaces)
-        return (trimmed.isEmpty ? "文字稿" : String(trimmed.prefix(80))) + ".\(type.fileExtension)"
+        return shortFileTitle(trimmed) + ".\(type.fileExtension)"
+    }
+
+    private static func shortFileTitle(_ title: String) -> String {
+        TitleFormatter.shortFileStem(title)
     }
 }
