@@ -60,6 +60,7 @@ struct TaskDetailView: View {
                     banner("正在分离说话人，下方为初步文字稿…", progress: task.stage.progress)
                 }
                 TranscriptView(
+                    id: task.id,
                     transcript: transcript,
                     diarized: task.diarized,
                     title: task.title

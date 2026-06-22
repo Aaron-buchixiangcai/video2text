@@ -2,14 +2,6 @@ import AppKit
 import Foundation
 import UniformTypeIdentifiers
 
-enum TranscriptFormat: String, CaseIterable, Identifiable {
-    case plain = "纯文字"
-    case timestamped = "带时间戳"
-    case diarized = "分发言人"
-
-    var id: String { rawValue }
-}
-
 enum ExportFileType: String, CaseIterable, Identifiable {
     case txt = "文本 (.txt)"
     case docx = "Word (.docx)"
@@ -35,34 +27,33 @@ enum ExportFileType: String, CaseIterable, Identifiable {
 }
 
 enum TranscriptExporter {
-    static func render(_ transcript: Transcript, format: TranscriptFormat) -> String {
-        switch format {
-        case .plain:
-            return transcript.plainText
-        case .timestamped:
-            return transcript.utterances.map { u in
-                "[\(formatTimestamp(u.start))] \(u.text)"
-            }.joined(separator: "\n")
-        case .diarized:
-            return transcript.coalesced().utterances.map { u in
-                let label = u.speaker.map { "说话人\($0 + 1)" } ?? "未知"
-                return "[\(formatTimestamp(u.start))] \(label)：\(u.text)"
-            }.joined(separator: "\n")
-        }
+    /// 按两个独立开关组合渲染：时间戳、说话人可分别开关，也可同时开。
+    static func render(_ transcript: Transcript, showTimestamps: Bool, showSpeakers: Bool) -> String {
+        guard showTimestamps || showSpeakers else { return transcript.plainText }
+        let source = showSpeakers ? transcript.coalesced().utterances : transcript.utterances
+        return source.map { u in
+            let time = showTimestamps ? "[\(formatTimestamp(u.start))] " : ""
+            let speaker = showSpeakers ? ((u.speaker.map { "说话人\($0 + 1)" } ?? "未知") + "：") : ""
+            return time + speaker + u.text
+        }.joined(separator: "\n")
     }
 
-    static func renderFile(_ transcript: Transcript, type: ExportFileType, diarized: Bool) -> String {
+    static func renderFile(
+        _ transcript: Transcript,
+        type: ExportFileType,
+        showTimestamps: Bool,
+        showSpeakers: Bool
+    ) -> String {
         switch type {
-        case .txt:
-            return render(transcript, format: diarized ? .diarized : .timestamped)
-        case .docx:
-            return render(transcript, format: diarized ? .diarized : .timestamped)
+        case .txt, .docx:
+            return render(transcript, showTimestamps: showTimestamps, showSpeakers: showSpeakers)
         case .srt:
-            return srt(transcript, includeSpeaker: diarized)
+            // 字幕格式天然带时间戳，仅说话人随开关
+            return srt(transcript, includeSpeaker: showSpeakers)
         case .vtt:
-            return vtt(transcript, includeSpeaker: diarized)
+            return vtt(transcript, includeSpeaker: showSpeakers)
         case .markdown:
-            return markdown(transcript, diarized: diarized)
+            return markdown(transcript, diarized: showSpeakers)
         }
     }
 
@@ -118,7 +109,8 @@ enum TranscriptExporter {
     static func exportWithPanel(
         _ transcript: Transcript,
         type: ExportFileType,
-        diarized: Bool,
+        showTimestamps: Bool,
+        showSpeakers: Bool,
         suggestedName: String
     ) {
         let panel = NSSavePanel()
@@ -131,20 +123,37 @@ enum TranscriptExporter {
         let outputURL = url.pathExtension.isEmpty
             ? url.appendingPathExtension(type.fileExtension)
             : url
-        let data = exportData(transcript, type: type, diarized: diarized, title: suggestedName)
-        try? data.write(to: outputURL, options: .atomic)
+        let data = exportData(
+            transcript, type: type,
+            showTimestamps: showTimestamps, showSpeakers: showSpeakers,
+            title: suggestedName
+        )
+        do {
+            try data.write(to: outputURL, options: .atomic)
+        } catch {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "导出失败"
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "好")
+            alert.runModal()
+        }
     }
 
     static func exportData(
         _ transcript: Transcript,
         type: ExportFileType,
-        diarized: Bool,
+        showTimestamps: Bool,
+        showSpeakers: Bool,
         title: String
     ) -> Data {
         if type == .docx {
-            return WordDocumentExporter.docxData(title: title, transcript: transcript, diarized: diarized)
+            return WordDocumentExporter.docxData(title: title, transcript: transcript, diarized: showSpeakers)
         }
-        return Data(renderFile(transcript, type: type, diarized: diarized).utf8)
+        return Data(renderFile(
+            transcript, type: type,
+            showTimestamps: showTimestamps, showSpeakers: showSpeakers
+        ).utf8)
     }
 
     private static func srtTime(_ seconds: Double) -> String {
@@ -159,11 +168,16 @@ enum TranscriptExporter {
         return String(format: "%02d:%02d:%02d.%03d", total / 3600, (total % 3600) / 60, total % 60, ms)
     }
 
-    private static func sanitizedFileName(_ name: String, type: ExportFileType) -> String {
+    /// 把标题转成安全的文件名主干（剔除 / \ : 等文件系统非法字符，再缩短）。
+    /// 单条与批量导出共用，避免标题含 "/" 时写盘失败。
+    static func safeFileStem(_ title: String) -> String {
         let invalid = CharacterSet(charactersIn: "/\\:?%*|\"<>")
-        let cleaned = name.components(separatedBy: invalid).joined(separator: "_")
-        let trimmed = cleaned.trimmingCharacters(in: .whitespaces)
-        return shortFileTitle(trimmed) + ".\(type.fileExtension)"
+        let cleaned = title.components(separatedBy: invalid).joined(separator: "_")
+        return shortFileTitle(cleaned.trimmingCharacters(in: .whitespaces))
+    }
+
+    private static func sanitizedFileName(_ name: String, type: ExportFileType) -> String {
+        safeFileStem(name) + ".\(type.fileExtension)"
     }
 
     private static func shortFileTitle(_ title: String) -> String {

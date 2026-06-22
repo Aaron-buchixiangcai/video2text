@@ -53,6 +53,21 @@ final class HistoryStore: ObservableObject {
         records.removeAll { $0.id == record.id }
     }
 
+    func delete(ids: Set<UUID>) {
+        for id in ids {
+            try? FileManager.default.removeItem(at: fileURL(for: id))
+        }
+        records.removeAll { ids.contains($0.id) }
+    }
+
+    func rename(_ record: HistoryRecord, to newTitle: String) {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let idx = records.firstIndex(where: { $0.id == record.id }) else { return }
+        records[idx].title = trimmed
+        persist(records[idx])
+    }
+
     private func persist(_ record: HistoryRecord) {
         AppPaths.ensureAll()
         let encoder = JSONEncoder()

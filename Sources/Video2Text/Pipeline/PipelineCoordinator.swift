@@ -59,7 +59,6 @@ final class PipelineCoordinator: ObservableObject {
             task.stage = .loadingModel(0)
             try await transcriber.load(
                 model: settings.model,
-                endpoint: settings.endpoint,
                 downloadProgress: { progress in
                     Task { @MainActor in
                         if case .loadingModel = task.stage {
@@ -96,7 +95,6 @@ final class PipelineCoordinator: ObservableObject {
                 task.stage = .diarizing(0)
                 do {
                     try await diarizer.load(
-                        endpoint: settings.endpoint,
                         downloadProgress: { progress in
                             Task { @MainActor in
                                 if case .diarizing = task.stage {
@@ -126,6 +124,7 @@ final class PipelineCoordinator: ObservableObject {
                 }
             }
 
+            try Task.checkCancellation()
             task.stage = .completed
             historyStore?.save(task: task)
         } catch is CancellationError {

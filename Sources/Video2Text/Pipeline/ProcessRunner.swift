@@ -40,44 +40,150 @@ enum ProcessRunner {
 
         let stdoutCollector = LineCollector(onLine: onStdoutLine)
         let stderrCollector = LineCollector(onLine: nil)
-        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-            stdoutCollector.append(handle.availableData)
-        }
-        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            stderrCollector.append(handle.availableData)
-        }
+        let state = ProcessRunState()
 
         return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                let timeoutTimer: DispatchWorkItem? = timeout.map { seconds in
-                    let item = DispatchWorkItem { [weak process] in process?.terminate() }
-                    DispatchQueue.global().asyncAfter(deadline: .now() + seconds, execute: item)
-                    return item
-                }
-                process.terminationHandler = { proc in
-                    timeoutTimer?.cancel()
-                    stdoutPipe.fileHandleForReading.readabilityHandler = nil
-                    stderrPipe.fileHandleForReading.readabilityHandler = nil
-                    // 把管道里剩余数据读完
-                    stdoutCollector.append(stdoutPipe.fileHandleForReading.readDataToEndOfFile())
-                    stderrCollector.append(stderrPipe.fileHandleForReading.readDataToEndOfFile())
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<ProcessResult, Error>) in
+                let stdoutHandle = stdoutPipe.fileHandleForReading
+                let stderrHandle = stderrPipe.fileHandleForReading
+
+                func finishSuccess() {
+                    stdoutHandle.readabilityHandler = nil
+                    stderrHandle.readabilityHandler = nil
                     continuation.resume(returning: ProcessResult(
-                        exitCode: proc.terminationStatus,
+                        exitCode: state.exitCode,
                         stdout: stdoutCollector.text,
                         stderr: stderrCollector.text
                     ))
                 }
+
+                // 用 readabilityHandler 持续读取并以"空数据=EOF"收尾，避免 readDataToEndOfFile
+                // 在孙进程持有管道写端时永久阻塞，也消除与 terminationHandler 的并发读竞态。
+                stdoutHandle.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    if data.isEmpty {
+                        handle.readabilityHandler = nil
+                        if state.markStdoutEOF() { finishSuccess() }
+                    } else {
+                        stdoutCollector.append(data)
+                    }
+                }
+                stderrHandle.readabilityHandler = { handle in
+                    let data = handle.availableData
+                    if data.isEmpty {
+                        handle.readabilityHandler = nil
+                        if state.markStderrEOF() { finishSuccess() }
+                    } else {
+                        stderrCollector.append(data)
+                    }
+                }
+
+                let timeoutTimer: DispatchWorkItem? = timeout.map { seconds in
+                    let item = DispatchWorkItem { state.terminateIfRunning(process) }
+                    DispatchQueue.global().asyncAfter(deadline: .now() + seconds, execute: item)
+                    return item
+                }
+
+                process.terminationHandler = { proc in
+                    timeoutTimer?.cancel()
+                    if state.markTerminated(proc.terminationStatus) {
+                        finishSuccess()
+                    } else {
+                        // 进程已退出但管道迟迟不 EOF（可能被孙进程持有）：2 秒后兜底收尾
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                            if state.forceFinish() { finishSuccess() }
+                        }
+                    }
+                }
+
                 do {
+                    // 先置 launched，再 run：否则 run() 返回后到置位前若收到取消，
+                    // terminateIfRunning 因 launched 仍为 false 而漏杀进程（run 抛错时
+                    // isRunning 为 false，terminate 仍不会被调用，安全）。
+                    state.markLaunched()
                     try process.run()
                 } catch {
                     timeoutTimer?.cancel()
                     process.terminationHandler = nil
-                    continuation.resume(throwing: ProcessRunnerError.launchFailed(error.localizedDescription))
+                    stdoutHandle.readabilityHandler = nil
+                    stderrHandle.readabilityHandler = nil
+                    if state.markResumed() {
+                        continuation.resume(throwing: ProcessRunnerError.launchFailed(error.localizedDescription))
+                    }
                 }
             }
         } onCancel: {
-            process.terminate()
+            state.terminateIfRunning(process)
         }
+    }
+}
+
+/// ProcessRunner 的线程安全状态机：保证 continuation 只 resume 一次，
+/// 且只对已 launch、仍在运行的进程调用 terminate()（否则 Foundation 会崩溃）。
+private final class ProcessRunState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var launched = false
+    private var resumed = false
+    private var stdoutEOF = false
+    private var stderrEOF = false
+    private var terminated = false
+    private var storedExitCode: Int32 = 0
+
+    var exitCode: Int32 {
+        lock.lock(); defer { lock.unlock() }
+        return storedExitCode
+    }
+
+    func markLaunched() {
+        lock.lock(); launched = true; lock.unlock()
+    }
+
+    /// 仅在进程确实启动过且仍在运行时终止，规避「task not launched」崩溃
+    func terminateIfRunning(_ process: Process) {
+        lock.lock(); let didLaunch = launched; lock.unlock()
+        if didLaunch && process.isRunning { process.terminate() }
+    }
+
+    /// 进程退出。返回 true 表示此刻所有读取也已结束、应立即收尾
+    func markTerminated(_ code: Int32) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        terminated = true
+        storedExitCode = code
+        return readyLocked()
+    }
+
+    func markStdoutEOF() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        stdoutEOF = true
+        return readyLocked()
+    }
+
+    func markStderrEOF() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        stderrEOF = true
+        return readyLocked()
+    }
+
+    /// 兜底：进程已退出但管道未 EOF 时强制收尾
+    func forceFinish() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard terminated, !resumed else { return false }
+        resumed = true
+        return true
+    }
+
+    /// 启动失败路径：抢占 resume 资格
+    func markResumed() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !resumed else { return false }
+        resumed = true
+        return true
+    }
+
+    private func readyLocked() -> Bool {
+        guard terminated, stdoutEOF, stderrEOF, !resumed else { return false }
+        resumed = true
+        return true
     }
 }
 

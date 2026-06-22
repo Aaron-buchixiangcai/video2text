@@ -42,7 +42,17 @@ enum AudioExtractor {
         }
 
         var samples: [Float] = []
+        var sinceCancelCheck = 0
         while let sampleBuffer = output.copyNextSampleBuffer() {
+            // 协作式取消：长视频解码可能耗时数十秒，否则会卡住任务队列且无法中途取消
+            sinceCancelCheck += 1
+            if sinceCancelCheck >= 64 {
+                sinceCancelCheck = 0
+                if Task.isCancelled {
+                    reader.cancelReading()
+                    throw CancellationError()
+                }
+            }
             guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
             let length = CMBlockBufferGetDataLength(blockBuffer)
             let count = length / MemoryLayout<Float>.size

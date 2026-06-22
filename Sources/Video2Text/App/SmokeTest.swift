@@ -47,7 +47,8 @@ enum SmokeTest {
                 let data = TranscriptExporter.exportData(
                     sample,
                     type: .docx,
-                    diarized: true,
+                    showTimestamps: true,
+                    showSpeakers: true,
                     title: "这是一个非常长的视频标题需要缩短"
                 )
                 try data.write(to: URL(fileURLWithPath: path), options: .atomic)

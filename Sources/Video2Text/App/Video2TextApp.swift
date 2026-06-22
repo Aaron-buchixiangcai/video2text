@@ -15,11 +15,12 @@ struct Video2TextApp: App {
         WindowGroup("视频转文字") {
             MainView(history: appState.history)
                 .environmentObject(appState)
+                .environmentObject(appState.transcriptToggles)
                 .frame(minWidth: 760, minHeight: 480)
         }
 
         Settings {
-            SettingsView()
+            SettingsView(settingsStore: appState.settingsStore)
                 .environmentObject(appState)
         }
     }

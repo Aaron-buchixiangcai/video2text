@@ -16,6 +16,7 @@ final class AppState: ObservableObject {
     let coordinator = PipelineCoordinator()
     let history = HistoryStore()
     let settingsStore = SettingsStore()
+    let transcriptToggles = TranscriptTogglesStore()
 
     init() {
         AppPaths.ensureAll()

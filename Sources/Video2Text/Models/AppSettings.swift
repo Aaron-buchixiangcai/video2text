@@ -4,13 +4,10 @@ struct AppSettings: Codable, Equatable {
     var model: String = Transcriber.defaultModel
     /// "zh" / "en" / "auto"
     var language: String = "zh"
-    /// 国内网络使用 hf-mirror.com 下载模型
-    var useMirror: Bool = false
     var cookiesPath: String?
     var diarizationEnabled: Bool = true
 
     var languageOrNil: String? { language == "auto" ? nil : language }
-    var endpoint: String? { useMirror ? "https://hf-mirror.com" : nil }
     var cookiesURL: URL? {
         guard let cookiesPath, !cookiesPath.isEmpty else { return nil }
         return URL(fileURLWithPath: (cookiesPath as NSString).expandingTildeInPath)

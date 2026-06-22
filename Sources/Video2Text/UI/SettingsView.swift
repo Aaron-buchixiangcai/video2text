@@ -2,16 +2,13 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject var appState: AppState
+    // 直接观察 SettingsStore：否则改了模型只写入了值，视图不刷新，下拉框看起来"点了没反应"
+    @ObservedObject var settingsStore: SettingsStore
     @State private var ytDlpVersion: String?
     @State private var updating = false
     @State private var updateMessage: String?
 
-    private var settings: Binding<AppSettings> {
-        Binding(
-            get: { appState.settingsStore.settings },
-            set: { appState.settingsStore.settings = $0 }
-        )
-    }
+    private var settings: Binding<AppSettings> { $settingsStore.settings }
 
     var body: some View {
         Form {
@@ -27,7 +24,6 @@ struct SettingsView: View {
                     Text("自动检测").tag("auto")
                 }
                 Toggle("区分发言人（说话人分离）", isOn: settings.diarizationEnabled)
-                Toggle("使用 hf-mirror.com 镜像下载模型（国内网络）", isOn: settings.useMirror)
             }
 
             Section("视频下载") {
