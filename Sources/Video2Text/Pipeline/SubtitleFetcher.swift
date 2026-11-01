@@ -2,7 +2,7 @@ import Foundation
 
 /// 取平台自带字幕，省掉下载音频和转写。
 /// YouTube 总是尝试；B 站的 AI 字幕要登录才拿得到，所以只在配置了 cookies.txt 时尝试。
-/// B 站音频 CDN 对部分视频返回 HTTP 567，有字幕时可完全避开下载。
+/// 分P视频这里只取第 1P 的字幕（--no-playlist），多P一起转要走音频下载。
 enum SubtitleFetcher {
     struct Result {
         let title: String

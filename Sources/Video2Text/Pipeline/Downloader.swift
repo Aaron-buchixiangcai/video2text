@@ -3,6 +3,14 @@ import Foundation
 struct DownloadResult {
     let fileURL: URL
     let title: String
+    /// B 站分P视频按顺序每P一个文件（含 fileURL 那一P）；单P视频为空
+    var parts: [MediaPart] = []
+}
+
+struct MediaPart {
+    /// 拼进文字稿的分P标题行，如「【P2】p02 Episode2 闷蒸」
+    let label: String
+    let fileURL: URL
 }
 
 enum DownloaderError: LocalizedError {
@@ -56,6 +64,7 @@ enum Downloader {
         url: String,
         cookiesFile: URL? = nil,
         destinationDir: URL,
+        maxParts: Int = 1,
         progress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> DownloadResult {
         if isBilibili(url) {
@@ -64,6 +73,7 @@ enum Downloader {
                 referer: "https://www.bilibili.com/",
                 cookiesFile: cookiesFile,
                 destinationDir: destinationDir,
+                maxParts: maxParts,
                 progress: progress
             )
         }
@@ -217,20 +227,26 @@ enum Downloader {
 
     // MARK: - 两段式路径：yt-dlp 仅解析直链，URLSession 带浏览器头下载
 
+    /// yt-dlp 每个条目先打印一行「序号\t合集标题\t标题」，再打印一行直链
+    private static let entryPrefix = "V2T-ENTRY\t"
+
     private static func downloadViaResolvedURL(
         url: String,
         referer: String,
         cookiesFile: URL?,
         destinationDir: URL,
+        maxParts: Int,
         progress: (@Sendable (Double) -> Void)?
     ) async throws -> DownloadResult {
         guard let ytDlp = YtDlpManager.locate() else { throw YtDlpError.notInstalled }
 
+        // 不加 --no-playlist：yt-dlp 把多P视频当播放列表展开（链接带 ?p=N 时只取那一P），
+        // 与 BBDown 的 -p 1-N 相同，只取前 maxParts P
         var args = [
             "-f", "ba[ext=m4a]/ba/b",
-            "--no-playlist",
+            "--playlist-items", "1:\(max(maxParts, 1))",
             "--user-agent", plainUA,
-            "--print", "%(title)s",
+            "--print", "\(entryPrefix)%(playlist_index)s\t%(playlist_title)s\t%(title)s",
             "--print", "urls",
         ]
         if let cookiesFile {
@@ -242,26 +258,60 @@ enum Downloader {
         guard result.exitCode == 0 else {
             throw DownloaderError.ytDlpFailed(exitCode: result.exitCode, stderr: result.stderr)
         }
-        let lines = result.stdout
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        guard lines.count >= 2,
-              let mediaURL = URL(string: lines[lines.count - 1]) else {
-            throw DownloaderError.outputMissing
-        }
-        let title = lines.dropLast().joined(separator: " ")
 
-        var request = URLRequest(url: mediaURL)
-        request.setValue(browserUA, forHTTPHeaderField: "User-Agent")
-        request.setValue(referer, forHTTPHeaderField: "Referer")
-        let fileURL = try await fetch(
-            request: request,
-            // CDN 常给 .m4s 等扩展名，AVURLAsset 不认；统一存成 .mp4
-            to: destinationDir.appendingPathComponent("audio.mp4"),
-            progress: progress
+        var entries: [(fields: [String], mediaURL: URL)] = []
+        var pending: [String]?
+        for line in result.stdout.components(separatedBy: .newlines) {
+            if line.hasPrefix(entryPrefix) {
+                // 单P视频没有播放列表字段，yt-dlp 打印 NA
+                pending = line.dropFirst(entryPrefix.count).components(separatedBy: "\t")
+                    .map { $0 == "NA" ? "" : $0 }
+            } else if let fields = pending, fields.count >= 3,
+                      let mediaURL = URL(string: line.trimmingCharacters(in: .whitespaces)),
+                      mediaURL.scheme?.hasPrefix("http") == true {
+                entries.append((fields, mediaURL))
+                pending = nil
+            }
+        }
+        guard let first = entries.first else { throw DownloaderError.outputMissing }
+
+        var parts: [MediaPart] = []
+        for (index, entry) in entries.enumerated() {
+            try Task.checkCancellation()
+            var request = URLRequest(url: entry.mediaURL)
+            request.setValue(browserUA, forHTTPHeaderField: "User-Agent")
+            request.setValue(referer, forHTTPHeaderField: "Referer")
+            // 镜像节点 upos-sz-mirrorcosov 对不带 Range 的请求返回 HTTP 567
+            // （Bilibili-Evolved #5857、yt-dlp #17847），带上整段 Range 后返回 206
+            request.setValue("bytes=0-", forHTTPHeaderField: "Range")
+            let count = Double(entries.count)
+            let fileURL = try await fetch(
+                request: request,
+                // CDN 常给 .m4s 等扩展名，AVURLAsset 不认；统一存成 .mp4
+                to: destinationDir.appendingPathComponent("audio-\(index + 1).mp4"),
+                progress: { progress?((Double(index) + $0) / count) }
+            )
+            parts.append(MediaPart(label: partLabel(entry.fields), fileURL: fileURL))
+        }
+
+        let playlistTitle = first.fields[1]
+        let title = entries.count > 1 && !playlistTitle.isEmpty ? playlistTitle : first.fields[2]
+        return DownloadResult(
+            fileURL: parts[0].fileURL,
+            title: title,
+            parts: parts.count > 1 ? parts : []
         )
-        return DownloadResult(fileURL: fileURL, title: title)
+    }
+
+    /// 「【P2】p02 Episode2 闷蒸」：yt-dlp 的分P标题是「合集标题 p02 分P名」，去掉重复的合集标题。
+    /// 只取前几P时 yt-dlp 不给合集总P数，所以不标总数
+    private static func partLabel(_ fields: [String]) -> String {
+        let (index, playlistTitle) = (fields[0], fields[1])
+        var title = fields[2]
+        if !playlistTitle.isEmpty, title.hasPrefix(playlistTitle) {
+            title = String(title.dropFirst(playlistTitle.count)).trimmingCharacters(in: .whitespaces)
+        }
+        return "【P\(index)】\(title)"
     }
 
     /// 直链（.mp4/.m4a 等）绕过 yt-dlp 直接下载

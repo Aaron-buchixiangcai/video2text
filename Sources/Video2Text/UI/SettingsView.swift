@@ -28,7 +28,12 @@ struct SettingsView: View {
 
             Section("视频下载") {
                 Toggle("视频有字幕时直接用字幕", isOn: settings.preferSubtitles)
-                Text("更快，不用下载音频和转写；但字幕没有说话人标注。YouTube 总是先找字幕；B站的 AI 字幕要登录才有，只在下方填了 cookies.txt 时尝试，也能避开部分视频音频下载失败（HTTP 567）的问题。")
+                Text("更快，不用下载音频和转写；但字幕没有说话人标注。YouTube 总是先找字幕；B站的 AI 字幕要登录才有，只在下方填了 cookies.txt 时尝试；分P视频用字幕时只取第 1P。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Stepper("B站分P视频最多转写前 \(settings.wrappedValue.maxBilibiliParts) P",
+                        value: settings.maxBilibiliParts, in: 1...50)
+                Text("课程合集常有几十上百P，全转很久。各P拼成一份文字稿，每P开头标出分P标题。只想要某一P时，粘贴带 ?p=N 的链接。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 LabeledContent("yt-dlp 版本", value: ytDlpVersion ?? "未安装")

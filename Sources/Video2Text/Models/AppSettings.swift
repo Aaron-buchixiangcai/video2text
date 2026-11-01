@@ -8,6 +8,8 @@ struct AppSettings: Codable, Equatable {
     var diarizationEnabled: Bool = true
     /// YouTube 视频有字幕时直接用字幕，不下载音频转写
     var preferSubtitles: Bool = true
+    /// B 站分P视频最多转写前几P（合集可能上百P）
+    var maxBilibiliParts: Int = 10
 
     var languageOrNil: String? { language == "auto" ? nil : language }
     var cookiesURL: URL? {
@@ -45,6 +47,7 @@ extension AppSettings {
         cookiesPath = try container.decodeIfPresent(String.self, forKey: .cookiesPath)
         diarizationEnabled = try container.decodeIfPresent(Bool.self, forKey: .diarizationEnabled) ?? diarizationEnabled
         preferSubtitles = try container.decodeIfPresent(Bool.self, forKey: .preferSubtitles) ?? preferSubtitles
+        maxBilibiliParts = try container.decodeIfPresent(Int.self, forKey: .maxBilibiliParts) ?? maxBilibiliParts
     }
 }
 

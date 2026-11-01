@@ -55,15 +55,22 @@ final class PipelineCoordinator: ObservableObject {
                 return
             }
 
-            // 1. 拿到本地媒体文件
-            let mediaURL = try await fetchMedia(for: task, into: taskDir, settings: settings)
+            // 1. 拿到本地媒体文件（B 站分P视频每P一个）
+            let parts = try await fetchMedia(for: task, into: taskDir, settings: settings)
             try Task.checkCancellation()
 
-            // 2. 解码 PCM
+            // 2. 解码 PCM；分P按顺序拼成一段音频，记下每P的起点用来插分P标题
             task.stage = .extracting
-            let audio = try await AudioExtractor.pcm(from: mediaURL)
+            var audio: [Float] = []
+            var markers: [(start: Double, label: String)] = []
+            for part in parts {
+                if parts.count > 1 {
+                    markers.append((Double(audio.count) / AudioExtractor.sampleRate, part.label))
+                }
+                audio.append(contentsOf: try await AudioExtractor.pcm(from: part.fileURL))
+                try Task.checkCancellation()
+            }
             guard !audio.isEmpty else { throw AudioExtractorError.noAudioTrack }
-            try Task.checkCancellation()
 
             // 3. 加载模型（带下载进度）
             task.stage = .loadingModel(0)
@@ -98,7 +105,7 @@ final class PipelineCoordinator: ObservableObject {
 
             // 转写结果先展示（不带说话人）
             let plain = Self.transcript(from: results).simplifiedChinese()
-            task.transcript = plain
+            task.transcript = Self.insertingPartMarkers(plain, markers)
 
             // 5. 说话人分离（失败不影响已有转写结果）
             if settings.diarizationEnabled {
@@ -124,7 +131,7 @@ final class PipelineCoordinator: ObservableObject {
                             }
                         }
                     )
-                    task.transcript = labeled.coalesced().simplifiedChinese()
+                    task.transcript = Self.insertingPartMarkers(labeled.coalesced().simplifiedChinese(), markers)
                     task.diarized = true
                 } catch is CancellationError {
                     throw CancellationError()
@@ -186,10 +193,10 @@ final class PipelineCoordinator: ObservableObject {
         for task: TranscriptionTask,
         into taskDir: URL,
         settings: AppSettings
-    ) async throws -> URL {
+    ) async throws -> [MediaPart] {
         switch task.source {
         case let .localFile(url):
-            return url
+            return [MediaPart(label: "", fileURL: url)]
 
         case let .remote(urlString):
             task.stage = .downloading(0)
@@ -207,18 +214,38 @@ final class PipelineCoordinator: ObservableObject {
                     url: url, destinationDir: taskDir, progress: onProgress
                 )
                 task.title = result.title
-                return result.fileURL
+                return [MediaPart(label: "", fileURL: result.fileURL)]
             }
 
             let result = try await Downloader.download(
                 url: urlString,
                 cookiesFile: settings.cookiesURL,
                 destinationDir: taskDir,
+                maxParts: settings.maxBilibiliParts,
                 progress: onProgress
             )
             task.title = result.title
-            return result.fileURL
+            return result.parts.isEmpty ? [MediaPart(label: "", fileURL: result.fileURL)] : result.parts
         }
+    }
+
+    /// 在每P起点前插一行分P标题（不带说话人），放在合并相邻段落之后，免得被并进正文
+    nonisolated static func insertingPartMarkers(_ transcript: Transcript, _ markers: [(start: Double, label: String)]) -> Transcript {
+        guard !markers.isEmpty else { return transcript }
+        var pending = markers[...]
+        var utterances: [Utterance] = []
+        for utterance in transcript.utterances {
+            while let marker = pending.first, marker.start <= utterance.start {
+                utterances.append(Utterance(speaker: nil, start: marker.start, end: marker.start, text: marker.label))
+                pending = pending.dropFirst()
+            }
+            utterances.append(utterance)
+        }
+        // 末尾几P没有识别出文字时也保留标题
+        utterances += pending.map { Utterance(speaker: nil, start: $0.start, end: $0.start, text: $0.label) }
+        var result = transcript
+        result.utterances = utterances
+        return result
     }
 
     /// Whisper 分段 → 不带说话人的 Transcript

@@ -27,6 +27,8 @@ enum SmokeTest {
         var transcriptJSON: URL?
 
         var remoteURL: String?
+        var maxParts = 1
+        var partLabels: [String: String] = [:]
         var searchSort = SearchSort.relevance
         var smokeCookies: URL?
         var it = arguments.makeIterator()
@@ -69,6 +71,8 @@ enum SmokeTest {
                 exit(0)
             case "--url":
                 remoteURL = it.next().map { LinkExtractor.bestEffortURLString(from: $0) }
+            case "--max-parts":
+                maxParts = Int(it.next() ?? "") ?? 1
             case "--extract-urls":
                 LinkExtractor.allURLStrings(in: it.next() ?? "").forEach { print($0) }
                 exit(0)
@@ -147,15 +151,22 @@ enum SmokeTest {
             try? FileManager.default.removeItem(at: dir)
             print("[smoke] 下载 \(remoteURL) ...")
             let result = try await Downloader.download(
-                url: remoteURL, destinationDir: dir,
+                url: remoteURL, destinationDir: dir, maxParts: maxParts,
                 progress: { p in
                     let pct = Int(p * 100)
                     if pct % 25 == 0 { print("[smoke] 下载 \(pct)%") }
                 }
             )
             print("[smoke] 标题: \(result.title)")
-            print("[smoke] 文件: \(result.fileURL.path)")
-            files.append(result.fileURL.path)
+            if result.parts.isEmpty {
+                print("[smoke] 文件: \(result.fileURL.path)")
+                files.append(result.fileURL.path)
+            }
+            for part in result.parts {
+                print("[smoke] 分P: \(part.label) → \(part.fileURL.lastPathComponent)")
+                files.append(part.fileURL.path)
+                partLabels[part.fileURL.path] = part.label
+            }
         }
 
         guard !files.isEmpty else {
@@ -165,7 +176,11 @@ enum SmokeTest {
 
         // 1. 解码并拼接 PCM
         var audio: [Float] = []
+        var markers: [(start: Double, label: String)] = []
         for file in files {
+            if let label = partLabels[file] {
+                markers.append((Double(audio.count) / AudioExtractor.sampleRate, label))
+            }
             let url = URL(fileURLWithPath: file)
             let pcm = try await AudioExtractor.pcm(from: url)
             print("[smoke] 解码 \(url.lastPathComponent): \(pcm.count) samples (\(String(format: "%.1f", Double(pcm.count) / AudioExtractor.sampleRate))s)")
@@ -224,6 +239,12 @@ enum SmokeTest {
                 let label = u.speaker.map { "说话人\($0 + 1)" } ?? "未知"
                 print("  [\(formatTimestamp(u.start)) → \(formatTimestamp(u.end))] \(label)：\(u.text)")
             }
+        }
+
+        if !markers.isEmpty {
+            finalTranscript = PipelineCoordinator.insertingPartMarkers(finalTranscript, markers)
+            print("[smoke] 带分P标题的文字稿：")
+            print(TranscriptExporter.render(finalTranscript, showTimestamps: true, showSpeakers: false))
         }
 
         if let outputDir {
