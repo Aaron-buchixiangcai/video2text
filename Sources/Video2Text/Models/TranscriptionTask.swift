@@ -12,8 +12,15 @@ enum TaskSource: Hashable {
     }
 }
 
+/// 文字稿来自哪里：平台字幕，或下载音频后 Whisper 转写
+enum TranscriptSource: String, Codable, Hashable {
+    case whisper
+    case subtitles
+}
+
 enum TaskStage: Hashable {
     case queued
+    case fetchingSubtitles
     case downloading(Double)
     case extracting
     case loadingModel(Double)
@@ -26,6 +33,7 @@ enum TaskStage: Hashable {
     var label: String {
         switch self {
         case .queued: return "排队中"
+        case .fetchingSubtitles: return "获取字幕"
         case .downloading: return "下载音频"
         case .extracting: return "解码音频"
         case .loadingModel: return "加载模型"
@@ -71,6 +79,7 @@ final class TranscriptionTask: ObservableObject, Identifiable {
     /// 转写完成即填充（无说话人标签），说话人分离完成后被替换为带标签版本
     @Published var transcript: Transcript?
     @Published var diarized = false
+    @Published var transcriptSource: TranscriptSource = .whisper
 
     /// 供 WhisperKit 回调提前终止用
     let cancelFlag = CancelFlag()

@@ -6,8 +6,16 @@ cd "$(dirname "$0")"
 
 echo "==> swift build -c release"
 if ! swift build -c release 2>&1 | tail -3; then
-    echo "==> CLT 构建失败，改用完整 Xcode 工具链重试"
-    DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release | tail -3
+    if [ -d /Applications/Xcode.app ]; then
+        echo "==> CLT 构建失败，改用完整 Xcode 工具链重试"
+        DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release | tail -3
+    else
+        # 新版 SDK 里 SwiftUI 的 @State 等依赖宏插件，插件只随 Xcode 提供；
+        # 没装 Xcode 时改用命令行工具自带的旧版 SDK
+        OLD_SDK="$(ls -d /Library/Developer/CommandLineTools/SDKs/MacOSX26*.sdk 2>/dev/null | sort -V | tail -1)"
+        echo "==> 未安装 Xcode，改用 $OLD_SDK 重试"
+        SDKROOT="$OLD_SDK" swift build -c release | tail -3
+    fi
 fi
 
 # 在 /tmp（非 iCloud 托管）里组装并签名：桌面/文稿等 iCloud 目录会不断给 .app 根目录

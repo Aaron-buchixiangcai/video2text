@@ -4,8 +4,15 @@ import UniformTypeIdentifiers
 struct MainView: View {
     @EnvironmentObject var appState: AppState
     @ObservedObject var history: HistoryStore
+    @ObservedObject var digests: DigestStore
+    @ObservedObject var batchSummary: BatchSummaryRunner
     @State private var urlInput = ""
     @State private var dropTargeted = false
+    @State private var showSearch = false
+
+    // 批量总结：先让用户确认汇总标题
+    @State private var askingSummaryTitle = false
+    @State private var summaryTitle = ""
 
     // 历史栏多选 / 重命名 / 设置入口
     @State private var selectMode = false
@@ -26,8 +33,22 @@ struct MainView: View {
         } detail: {
             detail
                 .safeAreaInset(edge: .top, spacing: 0) {
-                    inputBar
+                    VStack(spacing: 0) {
+                        inputBar
+                        summaryBanner
+                    }
                 }
+        }
+        .sheet(isPresented: $showSearch) {
+            SearchView()
+                .environmentObject(appState)
+        }
+        .alert("总结选中的 \(selectedHistory.count) 条", isPresented: $askingSummaryTitle) {
+            TextField("汇总标题", text: $summaryTitle)
+            Button("取消", role: .cancel) {}
+            Button("开始") { startBatchSummary() }
+        } message: {
+            Text("逐条写总结（已有的跳过），两条以上再生成一份汇总。用本机 Claude Code 的账号和额度。")
         }
         .dropDestination(for: URL.self) { urls, _ in
             let mediaURLs = urls.filter { $0.isFileURL }
@@ -71,13 +92,20 @@ struct MainView: View {
 
     private var inputBar: some View {
         HStack(spacing: 8) {
-            TextField("粘贴视频链接（抖音 / B站 / YouTube ...）", text: $urlInput)
+            TextField("粘贴视频链接，可一次粘贴多个（抖音 / B站 / YouTube / 小红书 ...）", text: $urlInput)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit(submit)
 
             Button("转写", action: submit)
                 .keyboardShortcut(.return, modifiers: .command)
                 .disabled(urlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+            Button {
+                showSearch = true
+            } label: {
+                Label("搜索…", systemImage: "magnifyingglass")
+            }
+            .help("按关键词搜索 YouTube / B站 视频并批量转写")
 
             Button("打开文件…") {
                 let panel = NSOpenPanel()
@@ -99,6 +127,52 @@ struct MainView: View {
         urlInput = ""
     }
 
+    // MARK: - 批量总结进度条
+
+    @ViewBuilder
+    private var summaryBanner: some View {
+        switch batchSummary.phase {
+        case .idle:
+            EmptyView()
+        case let .waitingForTranscription(count):
+            bannerRow("这批 \(count) 个视频转写完后会自动总结", showsSpinner: false)
+        case let .summarizing(done, total):
+            bannerRow("正在写单篇总结 \(done)/\(total)…", showsSpinner: true)
+        case .digesting:
+            bannerRow("正在生成汇总…", showsSpinner: true)
+        case let .failed(message):
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text(message)
+                    .font(.callout)
+                    .textSelection(.enabled)
+                    .lineLimit(6)
+                Spacer()
+                Button("关闭") { batchSummary.dismissError() }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.orange.opacity(0.12))
+        }
+    }
+
+    private func bannerRow(_ text: String, showsSpinner: Bool) -> some View {
+        HStack(spacing: 6) {
+            if showsSpinner {
+                ProgressView().controlSize(.small)
+            } else {
+                Image(systemName: "clock")
+                    .foregroundStyle(.secondary)
+            }
+            Text(text).font(.callout)
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.accentColor.opacity(0.1))
+    }
+
     // MARK: - 侧栏
 
     private var sidebar: some View {
@@ -114,6 +188,28 @@ struct MainView: View {
                                 }
                                 Button("移除", role: .destructive) { appState.remove(task) }
                             }
+                    }
+                }
+            }
+            if !digests.records.isEmpty {
+                Section("汇总") {
+                    ForEach(digests.records) { digest in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Label(TitleFormatter.shortDisplay(digest.title), systemImage: "sparkles")
+                                .lineLimit(1)
+                            Text("\(digest.recordIDs.count) 个视频 · \(digest.date.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .tag(SidebarItem.digest(digest.id))
+                        .contextMenu {
+                            Button("删除", role: .destructive) {
+                                digests.delete(digest)
+                                if appState.selection == .digest(digest.id) {
+                                    appState.selection = nil
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -181,6 +277,12 @@ struct MainView: View {
                 barIconButton("checklist", help: allHistorySelected ? "取消全选" : "全选") {
                     toggleSelectAll()
                 }
+                Spacer()
+                barIconButton("sparkles", help: "总结选中的 \(selectedHistory.count) 项") {
+                    summaryTitle = defaultSummaryTitle()
+                    askingSummaryTitle = true
+                }
+                .disabled(selectedHistory.isEmpty || batchSummary.isRunning)
                 Spacer()
                 barIconButton("square.and.arrow.up", help: "导出选中的 \(selectedHistory.count) 项") {
                     showExportFormats = true
@@ -265,6 +367,21 @@ struct MainView: View {
         selectedHistory.removeAll()
     }
 
+    private func defaultSummaryTitle() -> String {
+        if selectedHistory.count == 1,
+           let record = history.records.first(where: { selectedHistory.contains($0.id) }) {
+            return record.title
+        }
+        return "\(selectedHistory.count) 个视频的汇总 \(Date().formatted(date: .numeric, time: .omitted))"
+    }
+
+    private func startBatchSummary() {
+        let ids = history.records.filter { selectedHistory.contains($0.id) }.map(\.id)
+        let title = summaryTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        appState.summarize(recordIDs: ids, topic: title.isEmpty ? defaultSummaryTitle() : title)
+        exitSelectMode()
+    }
+
     private func performBatchDelete() {
         if case let .history(id)? = appState.selection, selectedHistory.contains(id) {
             appState.selection = nil
@@ -340,9 +457,21 @@ struct MainView: View {
                     id: record.id,
                     transcript: record.transcript,
                     diarized: record.diarized,
-                    title: record.title
+                    title: record.title,
+                    summary: record.summary,
+                    isSummarizing: batchSummary.isRunning,
+                    onSummarize: {
+                        appState.summarize(recordIDs: [record.id], topic: record.title)
+                    }
                 )
                 .id(record.id)
+            } else {
+                placeholder
+            }
+        case let .digest(id):
+            if let digest = digests.record(for: id) {
+                DigestView(digest: digest)
+                    .id(digest.id)
             } else {
                 placeholder
             }
@@ -358,6 +487,9 @@ struct MainView: View {
                 .foregroundStyle(.tertiary)
             Text("粘贴视频链接，或把视频文件拖进窗口")
                 .foregroundStyle(.secondary)
+            Text("点「搜索…」可按关键词批量找视频；在历史里多选后可批量总结")
+                .font(.callout)
+                .foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

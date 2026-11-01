@@ -27,6 +27,10 @@ struct SettingsView: View {
             }
 
             Section("视频下载") {
+                Toggle("YouTube 视频有字幕时直接用字幕", isOn: settings.preferSubtitles)
+                Text("更快，不用下载音频和转写；但字幕没有说话人标注。B站多数视频没有字幕，始终用语音识别。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 LabeledContent("yt-dlp 版本", value: ytDlpVersion ?? "未安装")
                 HStack {
                     Button(updating ? "更新中…" : "检查更新") {
@@ -41,13 +45,20 @@ struct SettingsView: View {
                     }
                 }
                 TextField(
-                    "cookies.txt 路径（抖音 / B 站会员视频需要）",
+                    "高级：cookies.txt 路径（通常无需填写）",
                     text: Binding(
                         get: { settings.wrappedValue.cookiesPath ?? "" },
                         set: { settings.wrappedValue.cookiesPath = $0.isEmpty ? nil : $0 }
                     )
                 )
-                Text("抖音链接通常需要登录 cookies：用浏览器扩展「Get cookies.txt LOCALLY」导出后在此填路径。下载失败时也可直接把视频文件拖入主窗口。")
+                Text("抖音会自动使用隔离的临时浏览器会话完成验证，不读取你的个人 Chrome 数据。只有登录后才能观看的视频才需要在这里指定 cookies.txt。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("总结（Claude）") {
+                LabeledContent("claude 命令行", value: Summarizer.locateClaude()?.path ?? "未找到")
+                Text("总结调用本机 Claude Code 的命令行版，用你自己的账号和额度，默认 \(Summarizer.model) 模型。提示未登录时，在终端运行 claude auth login。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

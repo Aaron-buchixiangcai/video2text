@@ -13,7 +13,11 @@ struct Video2TextApp: App {
 
     var body: some Scene {
         WindowGroup("视频转文字") {
-            MainView(history: appState.history)
+            MainView(
+                history: appState.history,
+                digests: appState.digests,
+                batchSummary: appState.batchSummary
+            )
                 .environmentObject(appState)
                 .environmentObject(appState.transcriptToggles)
                 .frame(minWidth: 760, minHeight: 480)

@@ -28,6 +28,11 @@ final class PipelineCoordinator: ObservableObject {
         runningTasks[task.id] = job
     }
 
+    /// 等到当前已排队的任务全部结束（之后再排队的不等）
+    func waitForQueue() async {
+        await queueTail?.value
+    }
+
     func cancel(_ task: TranscriptionTask) {
         task.cancelFlag.cancel()
         runningTasks[task.id]?.cancel()
@@ -45,6 +50,11 @@ final class PipelineCoordinator: ObservableObject {
         }
 
         do {
+            // 0. YouTube 有字幕就直接用，跳过下载和转写
+            if try await useSubtitlesIfAvailable(for: task, into: taskDir, settings: settings) {
+                return
+            }
+
             // 1. 拿到本地媒体文件
             let mediaURL = try await fetchMedia(for: task, into: taskDir, settings: settings)
             try Task.checkCancellation()
@@ -136,6 +146,40 @@ final class PipelineCoordinator: ObservableObject {
                 task.stage = .failed(error.localizedDescription)
             }
         }
+    }
+
+    /// 成功用上字幕返回 true；没有字幕或取字幕出错都返回 false，由调用方继续走转写
+    private func useSubtitlesIfAvailable(
+        for task: TranscriptionTask,
+        into taskDir: URL,
+        settings: AppSettings
+    ) async throws -> Bool {
+        guard settings.preferSubtitles,
+              case let .remote(urlString) = task.source,
+              SubtitleFetcher.isEligible(urlString) else { return false }
+        task.stage = .fetchingSubtitles
+        let fetched: SubtitleFetcher.Result?
+        do {
+            fetched = try await SubtitleFetcher.fetch(
+                url: urlString,
+                cookiesFile: settings.cookiesURL,
+                destinationDir: taskDir.appendingPathComponent("subs")
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            NSLog("获取字幕失败，改用转写: \(error.localizedDescription)")
+            return false
+        }
+        try Task.checkCancellation()
+        guard let fetched else { return false }
+
+        task.title = fetched.title
+        task.transcript = fetched.transcript.simplifiedChinese()
+        task.transcriptSource = .subtitles
+        task.stage = .completed
+        historyStore?.save(task: task)
+        return true
     }
 
     private func fetchMedia(

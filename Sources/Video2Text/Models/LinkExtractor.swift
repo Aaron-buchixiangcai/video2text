@@ -17,6 +17,22 @@ enum LinkExtractor {
         return nil
     }
 
+    /// 文中所有 http(s) 链接，去重并保持出现顺序（用于一次粘贴多个链接）
+    static func allURLStrings(in text: String) -> [String] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else {
+            return []
+        }
+        let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+        var seen = Set<String>()
+        return detector.matches(in: trimmed, options: [], range: range)
+            .compactMap(\.url)
+            .filter { ["http", "https"].contains($0.scheme?.lowercased() ?? "") }
+            .map { sanitize($0.absoluteString) }
+            .filter { seen.insert($0).inserted }
+    }
+
     static func bestEffortURLString(from text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return firstURLString(in: trimmed) ?? trimmed
@@ -39,7 +55,7 @@ enum LinkExtractor {
     }
 
     private static func detectWithRegex(in text: String) -> String? {
-        let pattern = #"(?i)(https?://[^\s"'<>]+|(?:www\.)?(?:youtube\.com|youtu\.be|bilibili\.com|b23\.tv|douyin\.com|v\.douyin\.com|tiktok\.com|vm\.tiktok\.com)/[^\s"'<>]+)"#
+        let pattern = #"(?i)(https?://[^\s"'<>]+|(?:www\.)?(?:youtube\.com|youtu\.be|bilibili\.com|b23\.tv|douyin\.com|v\.douyin\.com|tiktok\.com|vm\.tiktok\.com|xiaohongshu\.com|xhslink\.com)/[^\s"'<>]+)"#
         guard let range = text.range(of: pattern, options: .regularExpression) else {
             return nil
         }

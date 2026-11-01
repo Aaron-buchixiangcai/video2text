@@ -25,13 +25,16 @@ enum DownloaderError: LocalizedError {
     private static func hint(for stderr: String) -> String {
         let lower = stderr.lowercased()
         if lower.contains("fresh cookies") || lower.contains("cookies") {
-            return "。该平台可能需要登录 cookies —— 请在设置中指定 cookies.txt（可用浏览器扩展 Get cookies.txt 导出）"
+            return "。自动验证未通过；请确认已安装 Google Chrome 后重试。只有登录可见视频才需要在高级设置中指定 cookies.txt"
         }
         if lower.contains("412") {
-            return "。可能被平台风控拦截，可在设置中配置登录 cookies 后重试"
+            return "。可能被平台风控拦截，请稍后重试；只有登录可见视频才需要在高级设置中指定 cookies.txt"
         }
         if lower.contains("unsupported url") {
             return "。该链接不被 yt-dlp 支持，可尝试在浏览器下载后把视频文件拖入本应用"
+        }
+        if lower.contains("no video") || lower.contains("requested format") || lower.contains("no formats") {
+            return "。该笔记可能是图文笔记（无视频可转写）；若是视频请确认链接有效或在设置中配置 cookies"
         }
         return ""
     }
@@ -64,6 +67,26 @@ enum Downloader {
                 progress: progress
             )
         }
+        if isDouyin(url) {
+            if let cookiesFile {
+                do {
+                    return try await downloadWithYtDlp(
+                        url: url,
+                        cookiesFile: cookiesFile,
+                        destinationDir: destinationDir,
+                        progress: progress
+                    )
+                } catch let error as DownloaderError {
+                    guard isFreshCookiesFailure(error) else { throw error }
+                    try Task.checkCancellation()
+                }
+            }
+            return try await downloadDouyinWithIsolatedBrowser(
+                url: url,
+                destinationDir: destinationDir,
+                progress: progress
+            )
+        }
         return try await downloadWithYtDlp(
             url: url, cookiesFile: cookiesFile,
             destinationDir: destinationDir, progress: progress
@@ -74,11 +97,67 @@ enum Downloader {
         url.contains("bilibili.com") || url.contains("b23.tv")
     }
 
+    private static func isDouyin(_ url: String) -> Bool {
+        guard let host = URL(string: url)?.host?.lowercased() else { return false }
+        return host == "douyin.com"
+            || host.hasSuffix(".douyin.com")
+            || host == "iesdouyin.com"
+            || host.hasSuffix(".iesdouyin.com")
+    }
+
+    private static func isFreshCookiesFailure(_ error: DownloaderError) -> Bool {
+        guard case let .ytDlpFailed(_, stderr) = error else { return false }
+        return stderr.lowercased().contains("fresh cookies")
+    }
+
+    private static func downloadDouyinWithIsolatedBrowser(
+        url: String,
+        destinationDir: URL,
+        progress: (@Sendable (Double) -> Void)?
+    ) async throws -> DownloadResult {
+        let maximumAttempts = 3
+        var lastFreshCookiesError: DownloaderError?
+
+        for attempt in 1...maximumAttempts {
+            try Task.checkCancellation()
+            let profileDir = try await DouyinBrowserSession.prepare(
+                url: url,
+                destinationDir: destinationDir
+            )
+            do {
+                try Task.checkCancellation()
+                let result = try await downloadWithYtDlp(
+                    url: url,
+                    cookiesFile: nil,
+                    browserCookiesProfile: profileDir,
+                    destinationDir: destinationDir,
+                    progress: progress
+                )
+                await DouyinBrowserSession.remove(profileDir)
+                return result
+            } catch {
+                await DouyinBrowserSession.remove(profileDir)
+                if let downloaderError = error as? DownloaderError,
+                   isFreshCookiesFailure(downloaderError),
+                   attempt < maximumAttempts {
+                    lastFreshCookiesError = downloaderError
+                    try Task.checkCancellation()
+                    try await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000)
+                    continue
+                }
+                throw error
+            }
+        }
+
+        throw lastFreshCookiesError ?? DownloaderError.outputMissing
+    }
+
     // MARK: - 标准路径：yt-dlp 直接下载
 
     private static func downloadWithYtDlp(
         url: String,
         cookiesFile: URL?,
+        browserCookiesProfile: URL? = nil,
         destinationDir: URL,
         progress: (@Sendable (Double) -> Void)?
     ) async throws -> DownloadResult {
@@ -97,11 +176,17 @@ enum Downloader {
             "--print", "after_move:\(printPrefix)%(title)s|%(filepath)s",
             "-o", "%(id)s.%(ext)s",
             "-P", destinationDir.path,
-            url,
         ]
         if let cookiesFile {
             args.append(contentsOf: ["--cookies", cookiesFile.path])
         }
+        if let browserCookiesProfile {
+            args.append(contentsOf: [
+                "--cookies-from-browser",
+                DouyinBrowserSession.browserSpec(for: browserCookiesProfile),
+            ])
+        }
+        args.append(contentsOf: ["--", url])
 
         let resultLine = ResultLineBox()
         let result = try await ProcessRunner.run(ytDlp, arguments: args, timeout: 3600) { line in
@@ -147,11 +232,11 @@ enum Downloader {
             "--user-agent", plainUA,
             "--print", "%(title)s",
             "--print", "urls",
-            url,
         ]
         if let cookiesFile {
             args.append(contentsOf: ["--cookies", cookiesFile.path])
         }
+        args.append(contentsOf: ["--", url])
 
         let result = try await ProcessRunner.run(ytDlp, arguments: args, timeout: 300)
         guard result.exitCode == 0 else {

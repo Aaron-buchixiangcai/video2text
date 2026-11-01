@@ -21,8 +21,13 @@ enum SmokeTest {
         var model = Transcriber.defaultModel
         var language: String? = "zh"
         var diarize = false
+        var downloadOnly = false
+        var outputDir: URL?
+        var outputTitle = "完整文字稿"
+        var transcriptJSON: URL?
 
         var remoteURL: String?
+        var searchSort = SearchSort.relevance
         var it = arguments.makeIterator()
         while let arg = it.next() {
             switch arg {
@@ -31,6 +36,13 @@ enum SmokeTest {
                 let value = it.next() ?? "zh"
                 language = value == "auto" ? nil : value
             case "--diarize": diarize = true
+            case "--download-only": downloadOnly = true
+            case "--output-dir":
+                outputDir = it.next().map { URL(fileURLWithPath: $0, isDirectory: true) }
+            case "--output-title":
+                outputTitle = it.next() ?? outputTitle
+            case "--export-transcript-json":
+                transcriptJSON = it.next().map { URL(fileURLWithPath: $0) }
             case "--words": break
             case "--simplify-text":
                 print(TextNormalizer.simplifiedChinese(it.next() ?? ""))
@@ -56,8 +68,73 @@ enum SmokeTest {
                 exit(0)
             case "--url":
                 remoteURL = it.next().map { LinkExtractor.bestEffortURLString(from: $0) }
+            case "--extract-urls":
+                LinkExtractor.allURLStrings(in: it.next() ?? "").forEach { print($0) }
+                exit(0)
+            case "--sort":
+                // 写在 --search 前面：--sort views|newest|relevance
+                switch it.next() {
+                case "views": searchSort = .views
+                case "newest": searchSort = .newest
+                default: searchSort = .relevance
+                }
+            case "--search":
+                // --search yt|bili 条数 关键词
+                let platform: SearchPlatform = it.next() == "bili" ? .bilibili : .youtube
+                let count = Int(it.next() ?? "") ?? 5
+                let results = try await VideoSearch.search(
+                    keyword: it.next() ?? "", platform: platform, count: count, sort: searchSort,
+                    onRetry: { print("[smoke] 限流，\($0) 秒后重试") }
+                )
+                for r in results {
+                    print("\(r.viewCountText ?? "-") | \(r.duration.map(formatTimestamp) ?? "-") | \(r.uploader ?? "-") | \(r.displayTitle) | \(r.url)")
+                }
+                exit(0)
+            case "--subtitles":
+                let url = it.next() ?? ""
+                let dir = AppPaths.downloads.appendingPathComponent("smoke-subs-\(UUID().uuidString)")
+                defer { try? FileManager.default.removeItem(at: dir) }
+                guard let fetched = try await SubtitleFetcher.fetch(url: url, cookiesFile: nil, destinationDir: dir) else {
+                    print("[smoke] 没有可用字幕")
+                    exit(0)
+                }
+                let text = TranscriptExporter.render(fetched.transcript.simplifiedChinese(), showTimestamps: true, showSpeakers: false)
+                print("[smoke] \(fetched.title) | 语言 \(fetched.transcript.language ?? "-") | \(fetched.transcript.utterances.count) 段")
+                print(String(text.prefix(800)))
+                exit(0)
+            case "--summarize-latest":
+                // 只打印，不写回历史记录：--summarize-latest [条数]，两条以上再打印汇总
+                let count = Int(it.next() ?? "") ?? 1
+                let records = await MainActor.run { HistoryStore().records }.prefix(count)
+                var summaries: [(title: String, summary: String)] = []
+                for record in records {
+                    let summary = try await Summarizer.summarize(record)
+                    summaries.append((record.title, summary))
+                    print("===== \(record.title)\n\(summary)\n")
+                }
+                if summaries.count >= 2 {
+                    print("===== 汇总\n" + (try await Summarizer.digest(topic: "冒烟测试", summaries: summaries)))
+                }
+                exit(0)
             default: files.append(arg)
             }
+        }
+
+        if let transcriptJSON {
+            guard let outputDir else {
+                throw CocoaError(.fileNoSuchFile, userInfo: [
+                    NSLocalizedDescriptionKey: "--export-transcript-json 需要同时指定 --output-dir",
+                ])
+            }
+            let data = try Data(contentsOf: transcriptJSON)
+            let transcript = try JSONDecoder().decode(Transcript.self, from: data)
+            try exportTranscript(
+                transcript,
+                to: outputDir,
+                title: outputTitle,
+                diarized: transcript.speakerCount != nil
+            )
+            exit(0)
         }
 
         // --url：走应用内 Downloader（验证 yt-dlp 参数与 B 站两段式路径）
@@ -91,6 +168,10 @@ enum SmokeTest {
             audio.append(contentsOf: pcm)
         }
         print("[smoke] 总时长 \(String(format: "%.1f", Double(audio.count) / AudioExtractor.sampleRate))s")
+        if downloadOnly {
+            print("[smoke] 下载与音频解码验证通过")
+            exit(0)
+        }
 
         // 2. 转写
         let transcriber = Transcriber()
@@ -107,6 +188,7 @@ enum SmokeTest {
         let elapsed = -start.timeIntervalSinceNow
         let audioSeconds = Double(audio.count) / AudioExtractor.sampleRate
         print("[smoke] 转写耗时 \(String(format: "%.1f", elapsed))s（\(String(format: "%.1f", audioSeconds / elapsed))x 实时）")
+        var finalTranscript = transcript(from: results).simplifiedChinese()
 
         let showWords = arguments.contains("--words")
         for result in results {
@@ -132,11 +214,79 @@ enum SmokeTest {
             })
             let dStart = Date()
             let transcript = try await diarizer.diarizedTranscript(audio: audio, transcription: results)
+            finalTranscript = transcript.coalesced().simplifiedChinese()
             print("[smoke] 分离耗时 \(String(format: "%.1f", -dStart.timeIntervalSinceNow))s，说话人数: \(transcript.speakerCount ?? 0)")
             for u in transcript.coalesced().utterances {
                 let label = u.speaker.map { "说话人\($0 + 1)" } ?? "未知"
                 print("  [\(formatTimestamp(u.start)) → \(formatTimestamp(u.end))] \(label)：\(u.text)")
             }
         }
+
+        if let outputDir {
+            try exportTranscript(
+                finalTranscript,
+                to: outputDir,
+                title: outputTitle,
+                diarized: diarize
+            )
+        }
+    }
+
+    private static func exportTranscript(
+        _ transcript: Transcript,
+        to outputDir: URL,
+        title: String,
+        diarized: Bool
+    ) throws {
+        try FileManager.default.createDirectory(
+            at: outputDir,
+            withIntermediateDirectories: true
+        )
+
+        let exports: [(name: String, type: ExportFileType, timestamps: Bool)] = [
+            ("完整文字稿.txt", .txt, false),
+            ("带时间戳文字稿.md", .markdown, true),
+            ("带时间戳文字稿.docx", .docx, true),
+            ("字幕.srt", .srt, true),
+        ]
+        for item in exports {
+            let data = TranscriptExporter.exportData(
+                transcript,
+                type: item.type,
+                showTimestamps: item.timestamps,
+                showSpeakers: diarized,
+                title: title
+            )
+            let url = outputDir.appendingPathComponent(item.name)
+            try data.write(to: url, options: .atomic)
+            print("[smoke] 已导出: \(url.path)")
+        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let jsonURL = outputDir.appendingPathComponent("结构化文字稿.json")
+        try encoder.encode(transcript).write(to: jsonURL, options: .atomic)
+        print("[smoke] 已导出: \(jsonURL.path)")
+    }
+
+    private static func transcript(from results: [TranscriptionResult]) -> Transcript {
+        let utterances = results
+            .flatMap(\.segments)
+            .compactMap { segment -> Utterance? in
+                let text = segment.text.trimmingCharacters(in: .whitespaces)
+                guard !text.isEmpty else { return nil }
+                return Utterance(
+                    speaker: nil,
+                    start: Double(segment.start),
+                    end: Double(segment.end),
+                    text: text
+                )
+            }
+            .sorted { $0.start < $1.start }
+        return Transcript(
+            utterances: utterances,
+            language: results.first?.language,
+            speakerCount: nil
+        )
     }
 }

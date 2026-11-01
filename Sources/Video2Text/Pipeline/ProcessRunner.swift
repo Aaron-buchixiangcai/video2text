@@ -25,6 +25,8 @@ enum ProcessRunner {
         _ executable: URL,
         arguments: [String],
         currentDirectory: URL? = nil,
+        environment: [String: String]? = nil,
+        standardInputFile: URL? = nil,
         timeout: TimeInterval? = nil,
         onStdoutLine: (@Sendable (String) -> Void)? = nil
     ) async throws -> ProcessResult {
@@ -32,6 +34,11 @@ enum ProcessRunner {
         process.executableURL = executable
         process.arguments = arguments
         if let currentDirectory { process.currentDirectoryURL = currentDirectory }
+        if let environment { process.environment = environment }
+        // 用文件做 stdin：内容大于管道缓冲区时也不会阻塞写入方
+        if let standardInputFile {
+            process.standardInput = try FileHandle(forReadingFrom: standardInputFile)
+        }
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()

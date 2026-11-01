@@ -1,11 +1,15 @@
 # 视频转文字
 
-macOS 原生应用：粘贴视频链接（抖音 / Bilibili / YouTube 等 yt-dlp 支持的上千个网站），自动下载音频并**在本地**转写为文字稿。支持三种输出：纯文字、带时间戳、区分发言人。完全免费、离线识别、不上传任何内容。
+macOS 原生应用：粘贴视频链接（抖音 / Bilibili / YouTube 等 yt-dlp 支持的上千个网站），自动下载音频并**在本地**转写为文字稿。支持三种输出：纯文字、带时间戳、区分发言人。语音识别免费、离线进行；只有使用「总结」功能时，文字稿才会发给 Claude。
 
 ## 功能
 
 - **链接转写**：粘贴链接 → 自动下载音频 → Whisper 本地识别（中英混合）
-- **分享文案识别**：可直接粘贴抖音等平台的整段分享文字，应用会自动提取其中的链接
+- **分享文案识别**：可直接粘贴抖音等平台的整段分享文字，应用会自动提取其中的链接；一次粘贴多个链接会逐个排队
+- **关键词搜索 → 打包总结**：点「搜索…」按关键词搜 B站 / YouTube，可按「综合 / 最多播放 / 最新发布」排序（YouTube 无「最新发布」），列表显示播放量、时长、UP 主；勾选后批量转写，勾上「转写完后自动总结并生成汇总」即一键出汇总。B站短时间内多次搜索会被限流（HTTP 412），App 会自动等待重试
+- **B站搜索插件**：yt-dlp 内置的 B站搜索不传排序参数、只保留链接，App 会写入一个 yt-dlp 插件（`~/Library/Application Support/Video2Text/bin/yt-dlp-plugins/`），沿用同一接口，只多传排序参数并保留标题、播放量
+- **YouTube 字幕优先**：有字幕的 YouTube 视频直接用字幕，不下载音频（设置里可关；字幕没有说话人标注）
+- **批量总结**：历史栏多选后点 ✨，逐条写单篇总结，两条以上再生成一份汇总，显示在侧栏「汇总」里；单条记录也可点「总结」。调用本机 Claude Code 命令行（`claude -p`，默认 sonnet），用你自己的账号和额度，需先在终端运行 `claude auth login`
 - **简体中文输出**：中文识别结果会统一转换为简体，避免 Whisper 偶发输出繁体
 - **本地文件**：把视频/音频文件直接拖进窗口（下载失败时的万能兜底）
 - **说话人分离**：自动标注「说话人1 / 说话人2 …」（SpeakerKit / Pyannote v4，本地运行）
@@ -16,6 +20,7 @@ macOS 原生应用：粘贴视频链接（抖音 / Bilibili / YouTube 等 yt-dlp
 ## 构建
 
 需要：Apple Silicon Mac，macOS 14+，Xcode Command Line Tools（`xcode-select --install`）。
+没装 Xcode 时，新版 SDK 缺 SwiftUI 宏插件会编译失败，`build.sh` 会自动改用命令行工具自带的 macOS 26 SDK；手动编译用 `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk swift build`。
 
 ```bash
 bash build.sh            # 构建 + 打包 dist/视频转文字.app
@@ -37,15 +42,20 @@ open "dist/视频转文字.app"
 |---|---|
 | YouTube | 直接可用 |
 | Bilibili | 直接可用（应用内置两段式下载，绕开海外 IP 的 412 风控；大会员视频需 cookies） |
-| 抖音 | 时好时坏（抖音风控频繁变化）。失败时：① 设置中配置 cookies.txt ② 设置中点「检查更新」升级 yt-dlp ③ 浏览器下载视频后拖入窗口 |
+| 抖音 | 直接粘贴链接即可；应用会自动用隔离的临时浏览器会话完成风控验证，不读取个人 Chrome 数据 |
+| 小红书 | 直接可用（`xhslink.com` 短链或整段分享文案直接粘贴即可；图文笔记无视频无法转写） |
 | 其他 | yt-dlp 支持的站点都可尝试；直链 .mp4/.m4a 也可直接粘贴 |
 
-cookies.txt 导出方法：浏览器装「Get cookies.txt LOCALLY」扩展，登录目标网站后导出，把文件路径填到设置中。
+只有登录后才能观看的视频才需要 cookies.txt；公开抖音链接通常无需手工配置。
 
 ## 命令行模式（调试用）
 
 ```bash
-.build/debug/Video2Text --smoke [--language zh|en|auto] [--diarize] [--url 链接] [本地文件...]
+.build/debug/Video2Text --smoke [--language zh|en|auto] [--diarize] [--download-only] [--url 链接] [本地文件...]
+.build/debug/Video2Text --smoke --search yt|bili 条数 关键词      # 测搜索
+.build/debug/Video2Text --smoke --subtitles YouTube链接           # 测字幕
+.build/debug/Video2Text --smoke --summarize-latest [条数]          # 总结最新几条历史，只打印不保存
+.build/debug/Video2Text --smoke --extract-urls "一段含多个链接的文字"
 ```
 
 ## 开发验证
