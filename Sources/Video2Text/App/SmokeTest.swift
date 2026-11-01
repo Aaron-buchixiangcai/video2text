@@ -28,6 +28,7 @@ enum SmokeTest {
 
         var remoteURL: String?
         var searchSort = SearchSort.relevance
+        var smokeCookies: URL?
         var it = arguments.makeIterator()
         while let arg = it.next() {
             switch arg {
@@ -90,11 +91,14 @@ enum SmokeTest {
                     print("\(r.viewCountText ?? "-") | \(r.duration.map(formatTimestamp) ?? "-") | \(r.uploader ?? "-") | \(r.displayTitle) | \(r.url)")
                 }
                 exit(0)
+            case "--cookies":
+                // 写在 --subtitles 前面：--cookies cookies.txt 路径
+                smokeCookies = it.next().map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
             case "--subtitles":
                 let url = it.next() ?? ""
                 let dir = AppPaths.downloads.appendingPathComponent("smoke-subs-\(UUID().uuidString)")
                 defer { try? FileManager.default.removeItem(at: dir) }
-                guard let fetched = try await SubtitleFetcher.fetch(url: url, cookiesFile: nil, destinationDir: dir) else {
+                guard let fetched = try await SubtitleFetcher.fetch(url: url, cookiesFile: smokeCookies, destinationDir: dir) else {
                     print("[smoke] 没有可用字幕")
                     exit(0)
                 }

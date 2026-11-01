@@ -100,7 +100,11 @@ enum VideoSearch {
         let waits: [UInt64] = [20, 40]
         for attempt in 0...waits.count {
             let result = try await ProcessRunner.run(ytDlp, arguments: args, timeout: 120)
-            let results = parse(result.stdout)
+            var results = parse(result.stdout)
+            if platform == .bilibili {
+                // B 站搜索会混进课堂付费课程（/cheese/）等非普通视频，下载必然失败
+                results = results.filter { $0.url.contains("/video/") }
+            }
             if !results.isEmpty { return results }
 
             let errorLine = result.stderr

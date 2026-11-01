@@ -50,7 +50,7 @@ final class PipelineCoordinator: ObservableObject {
         }
 
         do {
-            // 0. YouTube 有字幕就直接用，跳过下载和转写
+            // 0. 有平台字幕就直接用，跳过下载和转写（B 站需配置 cookies 才有 AI 字幕）
             if try await useSubtitlesIfAvailable(for: task, into: taskDir, settings: settings) {
                 return
             }
@@ -156,7 +156,7 @@ final class PipelineCoordinator: ObservableObject {
     ) async throws -> Bool {
         guard settings.preferSubtitles,
               case let .remote(urlString) = task.source,
-              SubtitleFetcher.isEligible(urlString) else { return false }
+              SubtitleFetcher.isEligible(urlString, hasCookies: settings.cookiesURL != nil) else { return false }
         task.stage = .fetchingSubtitles
         let fetched: SubtitleFetcher.Result?
         do {

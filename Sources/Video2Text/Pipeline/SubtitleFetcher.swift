@@ -1,16 +1,22 @@
 import Foundation
 
-/// 取 YouTube 自带字幕，省掉下载音频和转写。
-/// B 站多数视频没有字幕，AI 字幕又要登录，所以只对 YouTube 启用。
+/// 取平台自带字幕，省掉下载音频和转写。
+/// YouTube 总是尝试；B 站的 AI 字幕要登录才拿得到，所以只在配置了 cookies.txt 时尝试。
+/// B 站音频 CDN 对部分视频返回 HTTP 567，有字幕时可完全避开下载。
 enum SubtitleFetcher {
     struct Result {
         let title: String
         let transcript: Transcript
     }
 
-    static func isEligible(_ url: String) -> Bool {
+    static func isEligible(_ url: String, hasCookies: Bool) -> Bool {
         guard let host = URL(string: url)?.host?.lowercased() else { return false }
-        return host == "youtu.be" || host == "youtube.com" || host.hasSuffix(".youtube.com")
+        if host == "youtu.be" || host == "youtube.com" || host.hasSuffix(".youtube.com") { return true }
+        return hasCookies && isBilibili(host)
+    }
+
+    private static func isBilibili(_ host: String) -> Bool {
+        host == "bilibili.com" || host.hasSuffix(".bilibili.com") || host == "b23.tv"
     }
 
     /// 没有合适字幕时返回 nil，调用方改走音频转写
@@ -19,6 +25,10 @@ enum SubtitleFetcher {
         var base = ["--ignore-config", "--no-warnings", "--no-playlist"]
         if let cookiesFile {
             base.append(contentsOf: ["--cookies", cookiesFile.path])
+        }
+        if let host = URL(string: url)?.host?.lowercased(), isBilibili(host) {
+            // 与 Downloader 一致：B 站 API 层要用非浏览器 UA
+            base.append(contentsOf: ["--user-agent", Downloader.plainUA])
         }
 
         let info = try await ProcessRunner.run(ytDlp, arguments: base + ["-J", "--", url], timeout: 120)
@@ -65,8 +75,9 @@ enum SubtitleFetcher {
         let language = ((json["language"] as? String) ?? "").components(separatedBy: "-").first?.lowercased() ?? ""
         func base(_ key: String) -> String { key.components(separatedBy: "-").first?.lowercased() ?? key }
 
+        // live_chat 是 YouTube 直播聊天，danmaku 是 B 站弹幕，都不是字幕
         let manual = ((json["subtitles"] as? [String: Any]) ?? [:]).keys
-            .filter { $0 != "live_chat" }
+            .filter { $0 != "live_chat" && $0 != "danmaku" }
             .sorted()
         if !manual.isEmpty {
             for preferred in [language, "zh", "en"] where !preferred.isEmpty {
