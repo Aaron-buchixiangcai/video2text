@@ -3,19 +3,18 @@ import UniformTypeIdentifiers
 
 struct MainView: View {
     @EnvironmentObject var appState: AppState
+    @Environment(\.openSettings) private var openSettings
     @ObservedObject var history: HistoryStore
     @ObservedObject var digests: DigestStore
     @ObservedObject var batchSummary: BatchSummaryRunner
     @State private var urlInput = ""
     @State private var dropTargeted = false
-    @State private var showSearch = false
 
     // 批量总结：先让用户确认汇总标题
     @State private var askingSummaryTitle = false
     @State private var summaryTitle = ""
 
     // 历史栏多选 / 重命名 / 设置入口
-    @State private var selectMode = false
     @State private var selectedHistory: Set<UUID> = []
     @State private var confirmBatchDelete = false
     @State private var showExportFormats = false
@@ -39,8 +38,8 @@ struct MainView: View {
                     }
                 }
         }
-        .sheet(isPresented: $showSearch) {
-            SearchView()
+        .sheet(isPresented: $appState.showSearch) {
+            SearchView(batchSummary: batchSummary)
                 .environmentObject(appState)
         }
         .alert("总结选中的 \(selectedHistory.count) 条", isPresented: $askingSummaryTitle) {
@@ -80,6 +79,14 @@ struct MainView: View {
         } message: {
             Text("输入新的名称")
         }
+        // 多选的勾选状态只在多选模式里有效；记录被删后也要从勾选里去掉
+        .onChange(of: appState.selectMode) { _, isOn in
+            if !isOn { selectedHistory.removeAll() }
+        }
+        .onChange(of: history.records.map(\.id)) { _, ids in
+            selectedHistory.formIntersection(ids)
+        }
+        .onAppear { appState.openSettingsAction = { openSettings() } }
         .alert("删除选中的 \(selectedHistory.count) 条记录？", isPresented: $confirmBatchDelete) {
             Button("取消", role: .cancel) {}
             Button("删除", role: .destructive) { performBatchDelete() }
@@ -92,8 +99,10 @@ struct MainView: View {
 
     private var inputBar: some View {
         HStack(spacing: 8) {
-            TextField("粘贴视频链接，可一次粘贴多个（抖音 / B站 / YouTube / 小红书 ...）", text: $urlInput)
+            // 占位文字要短：窗口最窄时输入框只有约 250pt，NSTextField 不会给占位文字加省略号
+            TextField("粘贴视频链接（可多个）", text: $urlInput)
                 .textFieldStyle(.roundedBorder)
+                .help("支持抖音 / B站 / YouTube / 小红书，可一次粘贴多个链接")
                 .onSubmit(submit)
 
             Button("转写", action: submit)
@@ -101,7 +110,7 @@ struct MainView: View {
                 .disabled(urlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
             Button {
-                showSearch = true
+                appState.showSearch = true
             } label: {
                 Label("搜索…", systemImage: "magnifyingglass")
             }
@@ -135,11 +144,12 @@ struct MainView: View {
         case .idle:
             EmptyView()
         case let .waitingForTranscription(count):
-            bannerRow("这批 \(count) 个视频转写完后会自动总结", showsSpinner: false)
+            bannerRow("「\(bannerTopic)」这批 \(count) 个视频转写完后会自动总结", showsSpinner: false)
         case let .summarizing(done, total):
-            bannerRow("正在写单篇总结 \(done)/\(total)…", showsSpinner: true)
+            // 几篇同时写，第一篇写完前完成数一直是 0，所以写明有几篇正在写
+            bannerRow("正在总结「\(bannerTopic)」：已完成 \(done)/\(total)，\(min(3, total - done)) 篇正在写", showsSpinner: true)
         case .digesting:
-            bannerRow("正在生成汇总…", showsSpinner: true)
+            bannerRow("正在为「\(bannerTopic)」生成汇总", showsSpinner: true)
         case let .failed(message):
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: "exclamationmark.triangle.fill")
@@ -157,6 +167,8 @@ struct MainView: View {
         }
     }
 
+    private var bannerTopic: String { TitleFormatter.shortDisplay(batchSummary.topic, maxCharacters: 16) }
+
     private func bannerRow(_ text: String, showsSpinner: Bool) -> some View {
         HStack(spacing: 6) {
             if showsSpinner {
@@ -165,8 +177,14 @@ struct MainView: View {
                 Image(systemName: "clock")
                     .foregroundStyle(.secondary)
             }
-            Text(text).font(.callout)
+            Text(text)
+                .font(.callout)
+                .lineLimit(1)
+                .truncationMode(.middle)
             Spacer()
+            Button("停止") { appState.cancelSummary() }
+                .controlSize(.small)
+                .help("停止这批总结；已写好的单篇总结会保留")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -194,13 +212,19 @@ struct MainView: View {
             if !digests.records.isEmpty {
                 Section("汇总") {
                     ForEach(digests.records) { digest in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Label(TitleFormatter.shortDisplay(digest.title), systemImage: "sparkles")
-                                .lineLimit(1)
-                            Text("\(digest.recordIDs.count) 个视频 · \(digest.date.formatted(date: .abbreviated, time: .shortened))")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                        // 两行都放进 Label 的标题里，第二行才和标题左对齐，不会缩到图标下面
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(TitleFormatter.display(digest.title))
+                                    .lineLimit(1)
+                                Text("\(digest.recordIDs.count) 个视频 · \(digest.date.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: "sparkles")
                         }
+                        .help(digest.title)
                         .tag(SidebarItem.digest(digest.id))
                         .contextMenu {
                             Button("删除", role: .destructive) {
@@ -214,7 +238,7 @@ struct MainView: View {
                 }
             }
             if !history.records.isEmpty {
-                Section("历史") {
+                Section(appState.selectMode ? "历史 · 已选 \(selectedHistory.count)/\(history.records.count)" : "历史") {
                     ForEach(history.records) { record in
                         historyRow(record)
                     }
@@ -226,7 +250,7 @@ struct MainView: View {
 
     @ViewBuilder
     private func historyRow(_ record: HistoryRecord) -> some View {
-        if selectMode {
+        if appState.selectMode {
             Button {
                 toggleSelection(record.id)
             } label: {
@@ -249,12 +273,14 @@ struct MainView: View {
 
     private func historyRowText(_ record: HistoryRecord) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(TitleFormatter.shortDisplay(record.title))
+            // 按侧栏宽度截断，悬停显示完整标题
+            Text(TitleFormatter.display(record.title))
                 .lineLimit(1)
             Text(record.date.formatted(date: .abbreviated, time: .shortened))
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+        .help(record.title)
     }
 
     @ViewBuilder
@@ -273,8 +299,10 @@ struct MainView: View {
 
     private var sidebarBottomBar: some View {
         HStack(spacing: 0) {
-            if selectMode {
-                barIconButton("checklist", help: allHistorySelected ? "取消全选" : "全选") {
+            if appState.selectMode {
+                // 与进入多选的 checklist 图标区分开，并按当前状态显示下一步动作
+                barIconButton(allHistorySelected ? "checklist.unchecked" : "checklist.checked",
+                              help: allHistorySelected ? "取消全选" : "全选") {
                     toggleSelectAll()
                 }
                 Spacer()
@@ -307,7 +335,7 @@ struct MainView: View {
                 .buttonStyle(.borderless)
                 .help("设置")
                 Spacer()
-                barIconButton("checklist", help: "选择") { selectMode = true }
+                barIconButton("checklist", help: "选择") { appState.selectMode = true }
                     .disabled(history.records.isEmpty)
             }
         }
@@ -363,7 +391,7 @@ struct MainView: View {
     }
 
     private func exitSelectMode() {
-        selectMode = false
+        appState.selectMode = false
         selectedHistory.removeAll()
     }
 
@@ -487,9 +515,11 @@ struct MainView: View {
                 .foregroundStyle(.tertiary)
             Text("粘贴视频链接，或把视频文件拖进窗口")
                 .foregroundStyle(.secondary)
-            Text("点「搜索…」可按关键词批量找视频；在历史里多选后可批量总结")
+            Text("点「搜索…」可按关键词批量找视频；点侧栏右下角的 \(Image(systemName: "checklist")) 多选历史，可批量总结")
                 .font(.callout)
                 .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

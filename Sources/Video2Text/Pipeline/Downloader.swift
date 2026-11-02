@@ -5,6 +5,8 @@ struct DownloadResult {
     let title: String
     /// B 站分P视频按顺序每P一个文件（含 fileURL 那一P）；单P视频为空
     var parts: [MediaPart] = []
+    /// 有分P没能解析（被删、限流、超时）时的说明，会写在文字稿开头
+    var warning: String?
 }
 
 struct MediaPart {
@@ -22,12 +24,24 @@ enum DownloaderError: LocalizedError {
         switch self {
         case let .ytDlpFailed(code, stderr):
             let hint = Self.hint(for: stderr)
-            return "视频下载失败（yt-dlp 退出码 \(code)）\(hint)\n\(stderr.suffix(400))"
+            return "视频下载失败（yt-dlp 退出码 \(code)）\(hint)\n\(Self.reason(from: stderr))"
         case .outputMissing:
             return "yt-dlp 执行完成但找不到输出文件"
         case let .directDownloadFailed(reason):
             return "音频下载失败：\(reason)"
         }
+    }
+
+    /// 只给用户看 ERROR 行（版本过旧之类的 WARNING 不相关）；没有 ERROR 行时取最后几行完整的行
+    static func reason(from stderr: String) -> String {
+        let lines = stderr.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let errors = lines.filter { $0.hasPrefix("ERROR") }
+            // 命令行参数的建议（--proxy）在 App 里用不上
+            .map { $0.replacingOccurrences(of: " You might want to try a VPN or a proxy server (with --proxy)", with: "") }
+        let picked = errors.isEmpty ? Array(lines.suffix(3)) : Array(errors.suffix(2))
+        return String(picked.joined(separator: "\n").prefix(400))
     }
 
     private static func hint(for stderr: String) -> String {
@@ -37,6 +51,11 @@ enum DownloaderError: LocalizedError {
         }
         if lower.contains("412") {
             return "。可能被平台风控拦截，请稍后重试；只有登录可见视频才需要在高级设置中指定 cookies.txt"
+        }
+        if lower.contains("may be deleted") || lower.contains("geo-restricted")
+            || lower.contains("video unavailable") || lower.contains("http error 404")
+            || lower.contains("does not exist") {
+            return "。视频不存在、已被删除或仅限部分地区观看；请先在浏览器里确认链接能打开"
         }
         if lower.contains("unsupported url") {
             return "。该链接不被 yt-dlp 支持，可尝试在浏览器下载后把视频文件拖入本应用"
@@ -227,8 +246,25 @@ enum Downloader {
 
     // MARK: - 两段式路径：yt-dlp 仅解析直链，URLSession 带浏览器头下载
 
-    /// yt-dlp 每个条目先打印一行「序号\t合集标题\t标题」，再打印一行直链
+    /// yt-dlp 每个条目先打印一行「序号\t合集标题\t标题」（各字段 JSON 编码，标题里的制表符和换行不会打乱格式），再打印一行直链
     private static let entryPrefix = "V2T-ENTRY\t"
+
+    /// 从收藏夹、合集、稍后再看里点开视频时，地址栏是 /list/…?bvid=BV… 或 /medialist/play/…?bvid=BV…。
+    /// yt-dlp 不加 --no-playlist 会把整个列表展开，所以先改写成视频本身的地址（保留 ?p=）
+    static func canonicalBilibiliURL(_ url: String) -> String {
+        guard var components = URLComponents(string: url),
+              let host = components.host?.lowercased(),
+              host == "bilibili.com" || host.hasSuffix(".bilibili.com"),
+              components.path.hasPrefix("/list/") || components.path.hasPrefix("/medialist/play/"),
+              let bvid = components.queryItems?.first(where: { $0.name == "bvid" })?.value,
+              !bvid.isEmpty else { return url }
+        let page = components.queryItems?.first { $0.name == "p" }
+        components.scheme = "https"
+        components.host = "www.bilibili.com"
+        components.path = "/video/\(bvid)"
+        components.queryItems = page.map { [$0] }
+        return components.string ?? url
+    }
 
     private static func downloadViaResolvedURL(
         url: String,
@@ -239,43 +275,54 @@ enum Downloader {
         progress: (@Sendable (Double) -> Void)?
     ) async throws -> DownloadResult {
         guard let ytDlp = YtDlpManager.locate() else { throw YtDlpError.notInstalled }
+        let parts = max(maxParts, 1)
 
         // 不加 --no-playlist：yt-dlp 把多P视频当播放列表展开（链接带 ?p=N 时只取那一P），
         // 与 BBDown 的 -p 1-N 相同，只取前 maxParts P
         var args = [
             "-f", "ba[ext=m4a]/ba/b",
-            "--playlist-items", "1:\(max(maxParts, 1))",
+            "--playlist-items", "1:\(parts)",
             "--user-agent", plainUA,
-            "--print", "\(entryPrefix)%(playlist_index)s\t%(playlist_title)s\t%(title)s",
+            "--print", "\(entryPrefix)%(playlist_index)j\t%(playlist_title)j\t%(title)j",
             "--print", "urls",
         ]
         if let cookiesFile {
             args.append(contentsOf: ["--cookies", cookiesFile.path])
         }
-        args.append(contentsOf: ["--", url])
+        args.append(contentsOf: ["--", canonicalBilibiliURL(url)])
 
-        let result = try await ProcessRunner.run(ytDlp, arguments: args, timeout: 300)
-        guard result.exitCode == 0 else {
-            throw DownloaderError.ytDlpFailed(exitCode: result.exitCode, stderr: result.stderr)
-        }
+        // 每P都要单独解析一遍（约 4–5 秒），超时随P数放宽
+        let result = try await ProcessRunner.run(
+            ytDlp, arguments: args, timeout: TimeInterval(max(300, 60 + 15 * parts))
+        )
 
         var entries: [(fields: [String], mediaURL: URL)] = []
         var pending: [String]?
-        for line in result.stdout.components(separatedBy: .newlines) {
+        for line in result.stdout.components(separatedBy: "\n") {
             if line.hasPrefix(entryPrefix) {
-                // 单P视频没有播放列表字段，yt-dlp 打印 NA
-                pending = line.dropFirst(entryPrefix.count).components(separatedBy: "\t")
-                    .map { $0 == "NA" ? "" : $0 }
+                pending = line.dropFirst(entryPrefix.count)
+                    .components(separatedBy: "\t")
+                    .map(decodePrintedField)
             } else if let fields = pending, fields.count >= 3,
-                      let mediaURL = URL(string: line.trimmingCharacters(in: .whitespaces)),
+                      let mediaURL = URL(string: line.trimmingCharacters(in: .whitespacesAndNewlines)),
                       mediaURL.scheme?.hasPrefix("http") == true {
                 entries.append((fields, mediaURL))
                 pending = nil
             }
         }
+        // 某一P解析失败（被删、限流）时 yt-dlp 跳过它、退出码非 0，已解析出的P照常用
+        guard result.exitCode == 0 || !entries.isEmpty else {
+            throw DownloaderError.ytDlpFailed(exitCode: result.exitCode, stderr: result.stderr)
+        }
+        var warning: String?
+        if result.exitCode != 0 {
+            let reason = result.timedOut ? "解析超时" : DownloaderError.reason(from: result.stderr)
+            warning = "只解析出 \(entries.count) P，其余分P没能获取：\(reason)"
+            NSLog("yt-dlp 退出码 \(result.exitCode)：\(warning ?? "")")
+        }
         guard let first = entries.first else { throw DownloaderError.outputMissing }
 
-        var parts: [MediaPart] = []
+        var downloaded: [MediaPart] = []
         for (index, entry) in entries.enumerated() {
             try Task.checkCancellation()
             var request = URLRequest(url: entry.mediaURL)
@@ -291,16 +338,29 @@ enum Downloader {
                 to: destinationDir.appendingPathComponent("audio-\(index + 1).mp4"),
                 progress: { progress?((Double(index) + $0) / count) }
             )
-            parts.append(MediaPart(label: partLabel(entry.fields), fileURL: fileURL))
+            downloaded.append(MediaPart(label: partLabel(entry.fields), fileURL: fileURL))
         }
 
+        // 有分P序号就是分P视频；即使只剩一P能下，也保留合集标题和分P标题
+        let isMultiPart = !first.fields[0].isEmpty
         let playlistTitle = first.fields[1]
-        let title = entries.count > 1 && !playlistTitle.isEmpty ? playlistTitle : first.fields[2]
+        let title = isMultiPart && !playlistTitle.isEmpty ? playlistTitle : first.fields[2]
         return DownloadResult(
-            fileURL: parts[0].fileURL,
+            fileURL: downloaded[0].fileURL,
             title: title,
-            parts: parts.count > 1 ? parts : []
+            parts: isMultiPart ? downloaded : [],
+            warning: warning
         )
+    }
+
+    /// %(field)j 的输出：字符串是 JSON 字符串，序号是数字，缺失字段是 NA
+    private static func decodePrintedField(_ raw: String) -> String {
+        guard raw != "NA",
+              let value = try? JSONSerialization.jsonObject(with: Data(raw.utf8), options: .fragmentsAllowed)
+        else { return "" }
+        if let string = value as? String { return string }
+        if let number = value as? NSNumber { return number.stringValue }
+        return ""
     }
 
     /// 「【P2】p02 Episode2 闷蒸」：yt-dlp 的分P标题是「合集标题 p02 分P名」，去掉重复的合集标题。

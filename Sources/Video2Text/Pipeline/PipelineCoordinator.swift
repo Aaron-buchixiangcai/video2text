@@ -56,90 +56,133 @@ final class PipelineCoordinator: ObservableObject {
             }
 
             // 1. 拿到本地媒体文件（B 站分P视频每P一个）
-            let parts = try await fetchMedia(for: task, into: taskDir, settings: settings)
+            let (parts, warning) = try await fetchMedia(for: task, into: taskDir, settings: settings)
             try Task.checkCancellation()
+            // 分P视频（哪怕只剩一P能下）每P开头标标题
+            let showMarkers = parts.contains { !$0.label.isEmpty }
 
-            // 2. 解码 PCM；分P按顺序拼成一段音频，记下每P的起点用来插分P标题
-            task.stage = .extracting
-            var audio: [Float] = []
-            var markers: [(start: Double, label: String)] = []
-            for part in parts {
-                if parts.count > 1 {
-                    markers.append((Double(audio.count) / AudioExtractor.sampleRate, part.label))
+            // 2–5 逐P做：内存只取决于最长的一P；每P的时间从 00:00 起算，与该P视频的进度一致；
+            // 说话人在每P内单独编号
+            let partCount = Double(parts.count)
+            var finished: [Utterance] = warning.map { [Utterance.partMarker("【提示】\($0)")] } ?? []
+            var language: String?
+            var speakerCount: Int?
+            var modelLoaded = false
+            var transcribedAny = false
+            var lastPartError: Error?
+            for (index, part) in parts.enumerated() {
+                let marker = showMarkers ? [Utterance.partMarker(part.label)] : []
+                let overall: @Sendable (Double) -> Double = { (Double(index) + $0) / partCount }
+                /// 多P里某一P解码或转写失败时只留标题并注明原因，继续下一P，已完成的P不丢
+                func skipFailedPart(_ error: Error) throws {
+                    if error is CancellationError || task.cancelFlag.isCancelled || parts.count == 1 { throw error }
+                    NSLog("第 \(index + 1) P 处理失败: \(error.localizedDescription)")
+                    lastPartError = error
+                    finished.append(.partMarker("\(part.label)（这一P处理失败：\(error.localizedDescription)）"))
                 }
-                audio.append(contentsOf: try await AudioExtractor.pcm(from: part.fileURL))
-                try Task.checkCancellation()
-            }
-            guard !audio.isEmpty else { throw AudioExtractorError.noAudioTrack }
 
-            // 3. 加载模型（带下载进度）
-            task.stage = .loadingModel(0)
-            try await transcriber.load(
-                model: settings.model,
-                downloadProgress: { progress in
-                    Task { @MainActor in
-                        if case .loadingModel = task.stage {
-                            task.stage = .loadingModel(progress.fractionCompleted)
-                        }
-                    }
-                }
-            )
-            try Task.checkCancellation()
-
-            // 4. 转写
-            task.stage = .transcribing(0)
-            let cancelFlag = task.cancelFlag
-            let results = try await transcriber.transcribe(
-                audio,
-                language: settings.languageOrNil,
-                cancelFlag: cancelFlag,
-                progress: { fraction in
-                    Task { @MainActor in
-                        if case .transcribing = task.stage {
-                            task.stage = .transcribing(fraction)
-                        }
-                    }
-                }
-            )
-            try Task.checkCancellation()
-
-            // 转写结果先展示（不带说话人）
-            let plain = Self.transcript(from: results).simplifiedChinese()
-            task.transcript = Self.insertingPartMarkers(plain, markers)
-
-            // 5. 说话人分离（失败不影响已有转写结果）
-            if settings.diarizationEnabled {
-                task.stage = .diarizing(0)
+                // 2. 解码 PCM
+                task.stage = .extracting
+                let audio: [Float]
                 do {
-                    try await diarizer.load(
+                    audio = try await AudioExtractor.pcm(from: part.fileURL)
+                    try Task.checkCancellation()
+                    guard !audio.isEmpty else { throw AudioExtractorError.noAudioTrack }
+                } catch {
+                    try skipFailedPart(error)
+                    continue
+                }
+
+                // 3. 加载模型（带下载进度）
+                if !modelLoaded {
+                    task.stage = .loadingModel(0)
+                    try await transcriber.load(
+                        model: settings.model,
                         downloadProgress: { progress in
                             Task { @MainActor in
-                                if case .diarizing = task.stage {
-                                    task.stage = .diarizing(progress.fractionCompleted * 0.2)
+                                if case .loadingModel = task.stage {
+                                    task.stage = .loadingModel(progress.fractionCompleted)
                                 }
                             }
                         }
                     )
-                    let labeled = try await diarizer.diarizedTranscript(
-                        audio: audio,
-                        transcription: results,
+                    modelLoaded = true
+                    try Task.checkCancellation()
+                }
+
+                // 4. 转写
+                task.stage = .transcribing(overall(0))
+                let cancelFlag = task.cancelFlag
+                let results: [TranscriptionResult]
+                do {
+                    results = try await transcriber.transcribe(
+                        audio,
+                        language: settings.languageOrNil,
+                        cancelFlag: cancelFlag,
                         progress: { fraction in
                             Task { @MainActor in
-                                if case .diarizing = task.stage {
-                                    task.stage = .diarizing(0.2 + fraction * 0.8)
+                                if case .transcribing = task.stage {
+                                    task.stage = .transcribing(overall(fraction))
                                 }
                             }
                         }
                     )
-                    task.transcript = Self.insertingPartMarkers(labeled.coalesced().simplifiedChinese(), markers)
-                    task.diarized = true
-                } catch is CancellationError {
-                    throw CancellationError()
+                    try Task.checkCancellation()
                 } catch {
-                    // 保留纯转写结果，仅记录分离失败
-                    NSLog("说话人分离失败: \(error.localizedDescription)")
+                    try skipFailedPart(error)
+                    continue
                 }
+                transcribedAny = true
+                language = language ?? results.first?.language
+
+                // 转写结果先展示（不带说话人）
+                let plain = Self.transcript(from: results).simplifiedChinese()
+                var partUtterances = plain.utterances
+                task.transcript = Transcript(
+                    utterances: finished + marker + partUtterances, language: language, speakerCount: speakerCount
+                )
+
+                // 5. 说话人分离（失败不影响已有转写结果）
+                if settings.diarizationEnabled {
+                    task.stage = .diarizing(overall(0))
+                    do {
+                        try await diarizer.load(
+                            downloadProgress: { progress in
+                                Task { @MainActor in
+                                    if case .diarizing = task.stage {
+                                        task.stage = .diarizing(overall(progress.fractionCompleted * 0.2))
+                                    }
+                                }
+                            }
+                        )
+                        let labeled = try await diarizer.diarizedTranscript(
+                            audio: audio,
+                            transcription: results,
+                            progress: { fraction in
+                                Task { @MainActor in
+                                    if case .diarizing = task.stage {
+                                        task.stage = .diarizing(overall(0.2 + fraction * 0.8))
+                                    }
+                                }
+                            }
+                        )
+                        let merged = labeled.coalesced().simplifiedChinese()
+                        partUtterances = merged.utterances
+                        speakerCount = max(speakerCount ?? 0, merged.speakerCount ?? 0)
+                        task.diarized = true
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        // 保留纯转写结果，仅记录分离失败
+                        NSLog("说话人分离失败: \(error.localizedDescription)")
+                    }
+                }
+                finished += marker + partUtterances
+                task.transcript = Transcript(utterances: finished, language: language, speakerCount: speakerCount)
             }
+            guard transcribedAny else { throw lastPartError ?? AudioExtractorError.noAudioTrack }
+            // 末尾失败或无声的P的标题行也要进最终文字稿
+            task.transcript = Transcript(utterances: finished, language: language, speakerCount: speakerCount)
 
             try Task.checkCancellation()
             task.stage = .completed
@@ -170,7 +213,8 @@ final class PipelineCoordinator: ObservableObject {
             fetched = try await SubtitleFetcher.fetch(
                 url: urlString,
                 cookiesFile: settings.cookiesURL,
-                destinationDir: taskDir.appendingPathComponent("subs")
+                destinationDir: taskDir.appendingPathComponent("subs"),
+                maxParts: settings.maxBilibiliParts
             )
         } catch is CancellationError {
             throw CancellationError()
@@ -193,10 +237,10 @@ final class PipelineCoordinator: ObservableObject {
         for task: TranscriptionTask,
         into taskDir: URL,
         settings: AppSettings
-    ) async throws -> [MediaPart] {
+    ) async throws -> (parts: [MediaPart], warning: String?) {
         switch task.source {
         case let .localFile(url):
-            return [MediaPart(label: "", fileURL: url)]
+            return ([MediaPart(label: "", fileURL: url)], nil)
 
         case let .remote(urlString):
             task.stage = .downloading(0)
@@ -214,7 +258,7 @@ final class PipelineCoordinator: ObservableObject {
                     url: url, destinationDir: taskDir, progress: onProgress
                 )
                 task.title = result.title
-                return [MediaPart(label: "", fileURL: result.fileURL)]
+                return ([MediaPart(label: "", fileURL: result.fileURL)], nil)
             }
 
             let result = try await Downloader.download(
@@ -225,27 +269,8 @@ final class PipelineCoordinator: ObservableObject {
                 progress: onProgress
             )
             task.title = result.title
-            return result.parts.isEmpty ? [MediaPart(label: "", fileURL: result.fileURL)] : result.parts
+            return (result.parts.isEmpty ? [MediaPart(label: "", fileURL: result.fileURL)] : result.parts, result.warning)
         }
-    }
-
-    /// 在每P起点前插一行分P标题（不带说话人），放在合并相邻段落之后，免得被并进正文
-    nonisolated static func insertingPartMarkers(_ transcript: Transcript, _ markers: [(start: Double, label: String)]) -> Transcript {
-        guard !markers.isEmpty else { return transcript }
-        var pending = markers[...]
-        var utterances: [Utterance] = []
-        for utterance in transcript.utterances {
-            while let marker = pending.first, marker.start <= utterance.start {
-                utterances.append(Utterance(speaker: nil, start: marker.start, end: marker.start, text: marker.label))
-                pending = pending.dropFirst()
-            }
-            utterances.append(utterance)
-        }
-        // 末尾几P没有识别出文字时也保留标题
-        utterances += pending.map { Utterance(speaker: nil, start: $0.start, end: $0.start, text: $0.label) }
-        var result = transcript
-        result.utterances = utterances
-        return result
     }
 
     /// Whisper 分段 → 不带说话人的 Transcript

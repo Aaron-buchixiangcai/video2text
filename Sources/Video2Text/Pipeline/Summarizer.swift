@@ -72,18 +72,95 @@ enum Summarizer {
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
 
+    /// 单次调用的文稿上限（字符）。中文约一字一个 token，给模型上下文留足余量
+    static let maxCharactersPerCall = 80_000
+
     static func summarize(_ record: HistoryRecord) async throws -> String {
-        let body = TranscriptExporter.render(
-            record.transcript, showTimestamps: true, showSpeakers: record.diarized
-        )
-        let content = """
+        let header = """
         标题：\(record.title)
         来源：\(record.source)
         文稿来源：\(record.transcriptSource == .subtitles ? "平台字幕" : "语音识别")
-
-        \(body)
         """
-        return try await run(prompt: videoPrompt, content: content)
+        let lines = compactLines(record.transcript, diarized: record.diarized)
+        let body = lines.joined(separator: "\n")
+        guard body.count > maxCharactersPerCall else {
+            return try await run(prompt: videoPrompt, content: header + "\n\n" + body)
+        }
+
+        // 太长（多P合集）：分段整理笔记，再按同一格式合成一篇
+        let chunks = chunked(lines, limit: maxCharactersPerCall)
+        var notes: [String] = []
+        for (index, chunk) in chunks.enumerated() {
+            let note = try await run(
+                prompt: chunkPrompt(index: index + 1, count: chunks.count),
+                content: header + "\n\n" + chunk
+            )
+            notes.append("【第 \(index + 1) 段笔记】\n\(note)")
+        }
+        return try await run(
+            prompt: videoPrompt + "\n\n注意：这个视频很长，下面给的不是文稿原文，而是按顺序分段整理的笔记。时间是各分P内的 [mm:ss]，引用时一并写出分P标题。",
+            content: header + "\n\n" + notes.joined(separator: "\n\n---\n\n")
+        )
+    }
+
+    static func chunkPrompt(index: Int, count: Int) -> String {
+        """
+        你会收到一个长视频文稿的第 \(index)/\(count) 段，文稿来自字幕或语音识别，可能有同音误识别。
+        用简体中文整理这一段的笔记，只输出以下内容：
+        1. 要点：10–20 条，每条一句，保留数字、术语、人名、产品名，附 [mm:ss] 时间；文稿里有【P几】标题时按分P分组并写出标题。
+        2. 可执行的信息：方法、步骤、工具、建议；没有就写"无"。
+        3. 疑似识别错误的专有名词；没有就写"无"。
+        只依据文稿，不补充文稿以外的信息。
+        """
+    }
+
+    /// 给 Claude 的文稿：同一说话人约 30 秒并成一行、只标一次时间，比逐句标时间省约四分之一篇幅；
+    /// 分P标题单独成行
+    static func compactLines(_ transcript: Transcript, diarized: Bool) -> [String] {
+        var lines: [String] = []
+        var current: (start: Double, speaker: Int?, text: String)?
+        func flush() {
+            guard let block = current else { return }
+            let who = diarized ? ((block.speaker.map { "说话人\($0 + 1)" } ?? "未知") + "：") : ""
+            lines.append("[\(formatTimestamp(block.start))] \(who)\(block.text)")
+            current = nil
+        }
+        for u in transcript.utterances {
+            let text = u.text.trimmingCharacters(in: .whitespaces)
+            guard !text.isEmpty else { continue }
+            if u.isMarker {
+                flush()
+                lines.append(text)
+            } else if var block = current, block.speaker == u.speaker, u.start - block.start < 30 {
+                let cjk = { (c: Character?) in c?.unicodeScalars.first?.properties.isIdeographic == true }
+                block.text += (cjk(block.text.last) && cjk(text.first) ? "" : " ") + text
+                current = block
+            } else {
+                flush()
+                current = (u.start, u.speaker, text)
+            }
+        }
+        flush()
+        return lines
+    }
+
+    /// 按行切块，每块不超过 limit 字符；块已过半时遇到分P标题就另起一块
+    static func chunked(_ lines: [String], limit: Int) -> [String] {
+        var chunks: [String] = []
+        var current: [String] = []
+        var size = 0
+        for line in lines {
+            let isPartTitle = line.hasPrefix("【P")
+            if !current.isEmpty, size + line.count > limit || (isPartTitle && size > limit / 2) {
+                chunks.append(current.joined(separator: "\n"))
+                current = []
+                size = 0
+            }
+            current.append(line)
+            size += line.count + 1
+        }
+        if !current.isEmpty { chunks.append(current.joined(separator: "\n")) }
+        return chunks
     }
 
     /// summaries 按 V1、V2… 的顺序排列
@@ -94,6 +171,8 @@ enum Summarizer {
         return try await run(prompt: digestPrompt(topic: topic, count: summaries.count), content: content)
     }
 
+    private static let timeout: TimeInterval = 900
+
     private static func run(prompt: String, content: String) async throws -> String {
         guard let claude = locateClaude() else { throw SummarizerError.claudeNotFound }
 
@@ -103,8 +182,18 @@ enum Summarizer {
         try content.write(to: input, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: input) }
 
-        var environment = ProcessInfo.processInfo.environment.filter { !$0.key.hasPrefix("CLAUDECODE") }
+        var environment = ProcessInfo.processInfo.environment
+        // 从 Claude Code 会话里用 open 启动 App 时，会继承该会话的 CLAUDE_CODE_* 和 ANTHROPIC_BASE_URL，
+        // claude 会改用宿主会话的登录通道并一直卡住。只要看到这类变量就全部去掉，用本机自己的登录
+        if environment.keys.contains(where: { $0.hasPrefix("CLAUDECODE") || $0.hasPrefix("CLAUDE_CODE_") }) {
+            environment = environment.filter { !$0.key.hasPrefix("CLAUDE") && $0.key != "ANTHROPIC_BASE_URL" }
+        }
         environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+        // claude 会读取 PWD 指向的目录。从终端 open 启动 App 时 PWD 可能在桌面、文稿等受保护目录，
+        // 系统会以本 App 的名义弹出访问授权并让 claude 一直等着，所以指向实际运行的临时目录
+        let workingDirectory = FileManager.default.temporaryDirectory
+        environment["PWD"] = workingDirectory.path
+        environment["OLDPWD"] = nil
 
         let result = try await ProcessRunner.run(
             claude,
@@ -118,15 +207,21 @@ enum Summarizer {
                 "--settings", #"{"outputStyle": "default"}"#,
             ],
             // 在临时目录运行，不读取任何项目的 CLAUDE.md
-            currentDirectory: FileManager.default.temporaryDirectory,
+            currentDirectory: workingDirectory,
             environment: environment,
             standardInputFile: input,
-            timeout: 900
+            timeout: timeout
         )
         let output = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         guard result.exitCode == 0, !output.isEmpty else {
-            let reason = result.stderr.isEmpty ? result.stdout : result.stderr
-            throw SummarizerError.failed(reason.trimmingCharacters(in: .whitespacesAndNewlines))
+            var reason = (result.stderr.isEmpty ? result.stdout : result.stderr)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if reason.isEmpty {
+                reason = result.timedOut
+                    ? "claude 超过 \(Int(timeout / 60)) 分钟没有返回"
+                    : "claude 没有输出（退出码 \(result.exitCode)）"
+            }
+            throw SummarizerError.failed(reason)
         }
         return output
     }

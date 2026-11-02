@@ -5,8 +5,9 @@ struct TaskRowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(TitleFormatter.shortDisplay(task.title))
+            Text(TitleFormatter.display(task.title))
                 .lineLimit(1)
+                .help(task.title)
 
             HStack(spacing: 6) {
                 stageBadge
@@ -63,7 +64,8 @@ struct TaskDetailView: View {
                     id: task.id,
                     transcript: transcript,
                     diarized: task.diarized,
-                    title: task.title
+                    title: task.title,
+                    speakerInfoPending: !task.stage.isFinished
                 )
             }
         } else {
@@ -87,10 +89,11 @@ struct TaskDetailView: View {
                     progressIndicator
                     Text(task.stage.label)
                         .font(.headline)
-                    Text(TitleFormatter.shortDisplay(task.title))
+                    Text(TitleFormatter.display(task.title))
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
+                        .multilineTextAlignment(.center)
                         .frame(maxWidth: 480)
                 }
             }

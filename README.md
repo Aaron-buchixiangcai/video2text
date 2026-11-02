@@ -9,6 +9,8 @@ macOS 原生应用：粘贴视频链接（抖音 / Bilibili / YouTube 等 yt-dlp
 - **关键词搜索 → 打包总结**：点「搜索…」按关键词搜 B站 / YouTube，可按「综合 / 最多播放 / 最新发布」排序（YouTube 无「最新发布」），列表显示播放量、时长、UP 主；勾选后批量转写，勾上「转写完后自动总结并生成汇总」即一键出汇总。B站短时间内多次搜索会被限流（HTTP 412），App 会自动等待重试
 - **B站搜索插件**：yt-dlp 内置的 B站搜索不传排序参数、只保留链接，App 会写入一个 yt-dlp 插件（`~/Library/Application Support/Video2Text/bin/yt-dlp-plugins/`），沿用同一接口，只多传排序参数并保留标题、播放量
 - **YouTube 字幕优先**：有字幕的 YouTube 视频直接用字幕，不下载音频（设置里可关；字幕没有说话人标注）
+- **B站分P视频**：课程合集按P逐个下载转写，拼成一份文字稿，每P开头标出分P标题、时间从 00:00 起算；设置里可改最多转前几P（默认 10）。链接带 `?p=N` 时只转那一P；从收藏夹、合集、稍后再看点开的链接会先改写成视频本身
+- **B站下载 HTTP 567**：镜像节点 upos-sz-mirrorcosov 拒绝不带 Range 头的请求，下载时一律带 `Range: bytes=0-`
 - **批量总结**：历史栏多选后点 ✨，逐条写单篇总结，两条以上再生成一份汇总，显示在侧栏「汇总」里；单条记录也可点「总结」。调用本机 Claude Code 命令行（`claude -p`，默认 sonnet），用你自己的账号和额度，需先在终端运行 `claude auth login`
 - **简体中文输出**：中文识别结果会统一转换为简体，避免 Whisper 偶发输出繁体
 - **本地文件**：把视频/音频文件直接拖进窗口（下载失败时的万能兜底）
@@ -56,7 +58,12 @@ open "dist/视频转文字.app"
 .build/debug/Video2Text --smoke --subtitles YouTube链接           # 测字幕
 .build/debug/Video2Text --smoke --summarize-latest [条数]          # 总结最新几条历史，只打印不保存
 .build/debug/Video2Text --smoke --extract-urls "一段含多个链接的文字"
+.build/debug/Video2Text --smoke --url B站链接 --max-parts 3 --download-only  # 测分P下载
+.build/debug/Video2Text --smoke --pipeline 主题 链接1 链接2 …     # 走 App 内完整流程：转写 → 总结 → 汇总（写入历史）
+.build/debug/Video2Text --smoke --canonical-bili 链接             # 看收藏夹 / 合集链接改写结果
 ```
+
+App 还带一个只在本机可用的测试接口，可以用 curl 搜索、提交、读结果、切换界面和截图，说明见 [docs/TEST_API.md](docs/TEST_API.md)。
 
 ## 开发验证
 

@@ -3,6 +3,8 @@ import SwiftUI
 /// 按关键词搜索视频，勾选后批量转写；可选转写完自动总结
 struct SearchView: View {
     @EnvironmentObject var appState: AppState
+    /// 直接观察：已有总结在跑时，下方「自动总结」开关要跟着变灰
+    @ObservedObject var batchSummary: BatchSummaryRunner
     @Environment(\.dismiss) private var dismiss
 
     @State private var keyword = ""
@@ -17,6 +19,7 @@ struct SearchView: View {
     @State private var autoSummarize = true
 
     private let claudeAvailable = Summarizer.locateClaude() != nil
+    private var canAutoSummarize: Bool { claudeAvailable && !batchSummary.isRunning }
 
     private var trimmedKeyword: String {
         keyword.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -125,9 +128,17 @@ struct SearchView: View {
             if !results.isEmpty {
                 Button(allSelected ? "取消全选" : "全选", action: toggleAll)
             }
-            Toggle("转写完后自动总结并生成汇总", isOn: $autoSummarize)
-                .disabled(!claudeAvailable || appState.batchSummary.isRunning)
-                .help(claudeAvailable ? "用本机 Claude Code 的账号写总结" : "未找到 claude 命令行，无法总结")
+            // 不能总结时显示为未勾选，避免看起来会总结、实际不会
+            Toggle("转写完后自动总结并生成汇总", isOn: canAutoSummarize ? $autoSummarize : .constant(false))
+                .disabled(!canAutoSummarize)
+                .help(!claudeAvailable ? "未找到 claude 命令行，无法总结"
+                      : batchSummary.isRunning ? "已有一批总结在进行；这批转写完后可在历史里多选再总结"
+                      : "用本机 Claude Code 的账号写总结")
+            if claudeAvailable && batchSummary.isRunning {
+                Text("（已有一批总结在进行）")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Spacer()
             Button("取消") { dismiss() }
                 .keyboardShortcut(.cancelAction)
@@ -181,7 +192,7 @@ struct SearchView: View {
         appState.submit(
             searchResults: chosen,
             topic: trimmedKeyword.isEmpty ? "搜索结果" : trimmedKeyword,
-            autoSummarize: autoSummarize && claudeAvailable && !appState.batchSummary.isRunning
+            autoSummarize: autoSummarize && canAutoSummarize
         )
         dismiss()
     }

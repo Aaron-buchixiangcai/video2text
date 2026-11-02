@@ -2,7 +2,7 @@ import Foundation
 
 /// 取平台自带字幕，省掉下载音频和转写。
 /// YouTube 总是尝试；B 站的 AI 字幕要登录才拿得到，所以只在配置了 cookies.txt 时尝试。
-/// 分P视频这里只取第 1P 的字幕（--no-playlist），多P一起转要走音频下载。
+/// 分P视频要转多P时不用字幕（这里只能取一P），交给音频下载逐P转写。
 enum SubtitleFetcher {
     struct Result {
         let title: String
@@ -19,17 +19,23 @@ enum SubtitleFetcher {
         host == "bilibili.com" || host.hasSuffix(".bilibili.com") || host == "b23.tv"
     }
 
-    /// 没有合适字幕时返回 nil，调用方改走音频转写
-    static func fetch(url: String, cookiesFile: URL?, destinationDir: URL) async throws -> Result? {
+    /// 没有合适字幕时返回 nil，调用方改走音频转写。
+    /// maxParts > 1 且 B 站链接是没指定 ?p= 的分P视频时也返回 nil，与音频路径转写同样的几P
+    static func fetch(url: String, cookiesFile: URL?, destinationDir: URL, maxParts: Int = 1) async throws -> Result? {
         guard let ytDlp = YtDlpManager.locate() else { return nil }
-        var base = ["--ignore-config", "--no-warnings", "--no-playlist"]
+        let bilibili = URL(string: url)?.host.map { isBilibili($0.lowercased()) } ?? false
+        // 与 Downloader 解析同一个视频（收藏夹、合集里的链接改写成视频本身）
+        let url = bilibili ? Downloader.canonicalBilibiliURL(url) : url
+        var common = ["--ignore-config", "--no-warnings"]
         if let cookiesFile {
-            base.append(contentsOf: ["--cookies", cookiesFile.path])
+            common.append(contentsOf: ["--cookies", cookiesFile.path])
         }
-        if let host = URL(string: url)?.host?.lowercased(), isBilibili(host) {
+        if bilibili {
             // 与 Downloader 一致：B 站 API 层要用非浏览器 UA
-            base.append(contentsOf: ["--user-agent", Downloader.plainUA])
+            common.append(contentsOf: ["--user-agent", Downloader.plainUA])
+            if maxParts > 1, try await isMultiPart(url, ytDlp: ytDlp, common: common) { return nil }
         }
+        let base = common + ["--no-playlist"]
 
         let info = try await ProcessRunner.run(ytDlp, arguments: base + ["-J", "--", url], timeout: 120)
         guard info.exitCode == 0,
@@ -68,6 +74,18 @@ enum SubtitleFetcher {
                 speakerCount: nil
             )
         )
+    }
+
+    /// 只列前两P、不逐P解析；链接已带 ?p= 时 yt-dlp 只返回那一P
+    private static func isMultiPart(_ url: String, ytDlp: URL, common: [String]) async throws -> Bool {
+        guard URLComponents(string: url)?.queryItems?.contains(where: { $0.name == "p" }) != true else { return false }
+        let result = try await ProcessRunner.run(
+            ytDlp, arguments: common + ["--flat-playlist", "--playlist-items", "1:2", "-J", "--", url], timeout: 120
+        )
+        guard result.exitCode == 0,
+              let json = try? JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any]
+        else { return false }
+        return (json["_type"] as? String) == "playlist" && ((json["entries"] as? [Any])?.count ?? 0) > 1
     }
 
     /// 优先人工字幕；没有则用视频原语言的自动字幕（键名以 -orig 结尾），不用机翻字幕

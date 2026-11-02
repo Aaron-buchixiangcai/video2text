@@ -19,7 +19,7 @@ struct DigestView: View {
                 Menu {
                     ForEach(Array(digest.recordIDs.enumerated()), id: \.offset) { index, id in
                         let title = index < digest.videoTitles.count ? digest.videoTitles[index] : ""
-                        Button("V\(index + 1)：\(TitleFormatter.shortDisplay(title))") {
+                        Button("V\(index + 1)：\(TitleFormatter.shortDisplay(title, maxCharacters: 30))") {
                             appState.selection = .history(id)
                         }
                         // 原记录被删除后无法跳转
@@ -46,7 +46,7 @@ struct DigestView: View {
             }
             .padding(10)
             Divider()
-            TranscriptTextView(text: digest.markdown)
+            TranscriptTextView(text: digest.markdown, markdown: true)
         }
         .navigationTitle(digest.title)
     }

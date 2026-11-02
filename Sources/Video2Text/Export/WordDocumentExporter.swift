@@ -24,6 +24,10 @@ enum WordDocumentExporter {
         var paragraphs = [paragraph(shortTitle(title), isTitle: true)]
         let items = diarized ? transcript.coalesced().utterances : transcript.utterances
         for utterance in items {
+            if utterance.isMarker {
+                paragraphs.append(paragraph(utterance.text, isTitle: false))
+                continue
+            }
             let label = diarized
                 ? (utterance.speaker.map { "说话人\($0 + 1)：" } ?? "")
                 : ""

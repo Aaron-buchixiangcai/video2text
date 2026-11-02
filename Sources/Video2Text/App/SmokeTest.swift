@@ -28,7 +28,6 @@ enum SmokeTest {
 
         var remoteURL: String?
         var maxParts = 1
-        var partLabels: [String: String] = [:]
         var searchSort = SearchSort.relevance
         var smokeCookies: URL?
         var it = arguments.makeIterator()
@@ -73,6 +72,9 @@ enum SmokeTest {
                 remoteURL = it.next().map { LinkExtractor.bestEffortURLString(from: $0) }
             case "--max-parts":
                 maxParts = Int(it.next() ?? "") ?? 1
+            case "--canonical-bili":
+                print(Downloader.canonicalBilibiliURL(it.next() ?? ""))
+                exit(0)
             case "--extract-urls":
                 LinkExtractor.allURLStrings(in: it.next() ?? "").forEach { print($0) }
                 exit(0)
@@ -109,6 +111,14 @@ enum SmokeTest {
                 let text = TranscriptExporter.render(fetched.transcript.simplifiedChinese(), showTimestamps: true, showSpeakers: false)
                 print("[smoke] \(fetched.title) | 语言 \(fetched.transcript.language ?? "-") | \(fetched.transcript.utterances.count) 段")
                 print(String(text.prefix(800)))
+                exit(0)
+            case "--pipeline":
+                // 走 App 内同一套流程（排队转写 → 每条总结 → 汇总），用当前设置，结果写进历史记录和汇总：
+                // --pipeline 主题 链接1 链接2 ...
+                let topic = it.next() ?? "冒烟测试"
+                var urls: [String] = []
+                while let next = it.next() { urls.append(next) }
+                await runPipeline(topic: topic, urls: urls)
                 exit(0)
             case "--summarize-latest":
                 // 只打印，不写回历史记录：--summarize-latest [条数]，两条以上再打印汇总
@@ -165,7 +175,6 @@ enum SmokeTest {
             for part in result.parts {
                 print("[smoke] 分P: \(part.label) → \(part.fileURL.lastPathComponent)")
                 files.append(part.fileURL.path)
-                partLabels[part.fileURL.path] = part.label
             }
         }
 
@@ -176,11 +185,7 @@ enum SmokeTest {
 
         // 1. 解码并拼接 PCM
         var audio: [Float] = []
-        var markers: [(start: Double, label: String)] = []
         for file in files {
-            if let label = partLabels[file] {
-                markers.append((Double(audio.count) / AudioExtractor.sampleRate, label))
-            }
             let url = URL(fileURLWithPath: file)
             let pcm = try await AudioExtractor.pcm(from: url)
             print("[smoke] 解码 \(url.lastPathComponent): \(pcm.count) samples (\(String(format: "%.1f", Double(pcm.count) / AudioExtractor.sampleRate))s)")
@@ -241,12 +246,6 @@ enum SmokeTest {
             }
         }
 
-        if !markers.isEmpty {
-            finalTranscript = PipelineCoordinator.insertingPartMarkers(finalTranscript, markers)
-            print("[smoke] 带分P标题的文字稿：")
-            print(TranscriptExporter.render(finalTranscript, showTimestamps: true, showSpeakers: false))
-        }
-
         if let outputDir {
             try exportTranscript(
                 finalTranscript,
@@ -255,6 +254,43 @@ enum SmokeTest {
                 diarized: diarize
             )
         }
+    }
+
+    @MainActor
+    private static func runPipeline(topic: String, urls: [String]) async {
+        // 直接运行可执行文件时没有 bundle，默认设置域不是 App 的，补上 App 的设置域
+        if Bundle.main.bundleIdentifier == nil {
+            UserDefaults.standard.addSuite(named: "com.haolinyu.video2text")
+        }
+        let settings = SettingsStore().settings
+        let history = HistoryStore()
+        let digests = DigestStore()
+        let coordinator = PipelineCoordinator()
+        coordinator.historyStore = history
+        print("[smoke] 模型 \(settings.model)，分P上限 \(settings.maxBilibiliParts)，说话人分离 \(settings.diarizationEnabled)，优先字幕 \(settings.preferSubtitles)，cookies \(settings.cookiesURL?.path ?? "无")")
+
+        let start = Date()
+        let tasks = urls.map { TranscriptionTask(source: .remote($0)) }
+        tasks.forEach { coordinator.enqueue($0, settings: settings) }
+        await coordinator.waitForQueue()
+        print("[smoke] 转写用时 \(Int(-start.timeIntervalSinceNow))s")
+        for task in tasks {
+            print("[smoke] \(task.stage) | \(task.transcriptSource) | \(task.title)")
+            guard let transcript = task.transcript else { continue }
+            let partLines = transcript.utterances.filter(\.isMarker)
+            print("  \(transcript.utterances.count) 段，\(transcript.plainText.count) 字，分P标题 \(partLines.count) 行，说话人 \(transcript.speakerCount.map(String.init) ?? "-")")
+            partLines.forEach { print("  \($0.text)") }
+        }
+
+        let completed = tasks.filter { $0.stage == .completed }.map(\.id)
+        let summaryStart = Date()
+        let digest = await BatchSummaryRunner().run(topic: topic, recordIDs: completed, history: history, digests: digests)
+        print("[smoke] 总结用时 \(Int(-summaryStart.timeIntervalSinceNow))s")
+        for id in completed {
+            let record = history.records.first { $0.id == id }
+            print("===== 总结：\(record?.title ?? "-")\n\(record?.summary ?? "（无）")\n")
+        }
+        print("===== 汇总\n\(digest?.content ?? "（未生成）")")
     }
 
     private static func exportTranscript(
