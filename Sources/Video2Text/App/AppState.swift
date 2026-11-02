@@ -32,6 +32,7 @@ final class AppState: ObservableObject {
 
     init() {
         AppPaths.ensureAll()
+        PipelineCoordinator.removeLeftoverDownloads()
         ytDlpInstalled = YtDlpManager.isInstalled
         showSetup = !ytDlpInstalled
         coordinator.historyStore = history
@@ -48,9 +49,7 @@ final class AppState: ObservableObject {
     func submit(urlString: String) {
         let urls = LinkExtractor.allURLStrings(in: urlString)
         if urls.count > 1 {
-            for (index, url) in urls.enumerated() {
-                enqueue(TranscriptionTask(source: .remote(url)), select: index == 0)
-            }
+            enqueue(batch: urls.map { TranscriptionTask(source: .remote($0)) })
             return
         }
         let extracted = LinkExtractor.bestEffortURLString(from: urlString)
@@ -68,14 +67,13 @@ final class AppState: ObservableObject {
     /// 返回是否安排了自动总结（已有一批在跑或找不到 claude 时不安排）
     @discardableResult
     func submit(searchResults: [SearchResult], topic: String, autoSummarize: Bool) -> Bool {
-        var batch: [TranscriptionTask] = []
-        for (index, result) in searchResults.enumerated() {
+        let batch = searchResults.map { result in
             let task = TranscriptionTask(source: .remote(result.url))
             // 没拿到标题时先显示链接，下载时由 yt-dlp 补上标题
             if let title = result.title { task.title = title }
-            enqueue(task, select: index == 0)
-            batch.append(task)
+            return task
         }
+        enqueue(batch: batch)
         // 已有一批总结在跑时不再排第二批（界面上的开关也会禁用）
         guard autoSummarize, !batch.isEmpty, !batchSummary.isRunning, Summarizer.locateClaude() != nil else { return false }
         batchSummary.prepare(topic: topic, count: batch.count)
@@ -120,6 +118,17 @@ final class AppState: ObservableObject {
             selection = .digest(digest.id)
         } else if recordIDs.count == 1 {
             selection = .history(recordIDs[0])
+        }
+    }
+
+    /// 一批任务一次性插到列表顶部（按提交顺序，从上到下就是处理顺序），再选中第一个。
+    /// 逐个插入并在中途改选中项时，侧栏的高亮会停在错的行上
+    private func enqueue(batch: [TranscriptionTask]) {
+        guard let first = batch.first else { return }
+        tasks.insert(contentsOf: batch, at: 0)
+        selection = .task(first.id)
+        for task in batch {
+            coordinator.enqueue(task, settings: settingsStore.settings)
         }
     }
 

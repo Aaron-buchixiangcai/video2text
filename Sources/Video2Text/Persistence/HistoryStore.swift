@@ -50,7 +50,9 @@ final class HistoryStore: ObservableObject {
         )
         persist(record)
         records.removeAll { $0.id == record.id }
-        records.insert(record, at: 0)
+        // 按提交时间倒序插入：边转边下时，后提交的视频（例如直接用了字幕）可能先完成
+        let index = records.firstIndex { $0.date < record.date } ?? records.endIndex
+        records.insert(record, at: index)
     }
 
     func delete(_ record: HistoryRecord) {

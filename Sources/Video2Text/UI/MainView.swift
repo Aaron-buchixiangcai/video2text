@@ -20,9 +20,21 @@ struct MainView: View {
     @State private var showExportFormats = false
     @State private var renamingRecord: HistoryRecord?
     @State private var renameText = ""
+    /// 侧栏里展开了哪些汇总（展开后列出这份汇总包含的视频）
+    @State private var expandedDigests: Set<UUID> = []
 
     private var allHistorySelected: Bool {
         !history.records.isEmpty && selectedHistory.count == history.records.count
+    }
+
+    /// 已经收进某份汇总的视频放在汇总下面，「历史」里只列还没汇总过的
+    private var ungroupedRecords: [HistoryRecord] {
+        let grouped = Set(digests.records.flatMap(\.recordIDs))
+        return history.records.filter { !grouped.contains($0.id) }
+    }
+
+    private var selectionCountSuffix: String {
+        appState.selectMode ? " · 已选 \(selectedHistory.count)/\(history.records.count)" : ""
     }
 
     var body: some View {
@@ -80,6 +92,9 @@ struct MainView: View {
             Text("输入新的名称")
         }
         // 多选的勾选状态只在多选模式里有效；记录被删后也要从勾选里去掉
+        .onChange(of: appState.selection) { _, item in
+            if case let .digest(id)? = item { expandedDigests.insert(id) }
+        }
         .onChange(of: appState.selectMode) { _, isOn in
             if !isOn { selectedHistory.removeAll() }
         }
@@ -210,42 +225,74 @@ struct MainView: View {
                 }
             }
             if !digests.records.isEmpty {
-                Section("汇总") {
+                // 「历史」为空时，多选的已选数量显示在这一节的标题上
+                Section("汇总" + (ungroupedRecords.isEmpty ? selectionCountSuffix : "")) {
                     ForEach(digests.records) { digest in
-                        // 两行都放进 Label 的标题里，第二行才和标题左对齐，不会缩到图标下面
-                        Label {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(TitleFormatter.display(digest.title))
-                                    .lineLimit(1)
-                                Text("\(digest.recordIDs.count) 个视频 · \(digest.date.formatted(date: .abbreviated, time: .shortened))")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        } icon: {
-                            Image(systemName: "sparkles")
-                        }
-                        .help(digest.title)
-                        .tag(SidebarItem.digest(digest.id))
-                        .contextMenu {
-                            Button("删除", role: .destructive) {
-                                digests.delete(digest)
-                                if appState.selection == .digest(digest.id) {
-                                    appState.selection = nil
-                                }
-                            }
-                        }
+                        digestGroup(digest)
                     }
                 }
             }
-            if !history.records.isEmpty {
-                Section(appState.selectMode ? "历史 · 已选 \(selectedHistory.count)/\(history.records.count)" : "历史") {
-                    ForEach(history.records) { record in
+            if !ungroupedRecords.isEmpty {
+                Section("历史" + selectionCountSuffix) {
+                    ForEach(ungroupedRecords) { record in
                         historyRow(record)
                     }
                 }
             }
         }
         .safeAreaInset(edge: .bottom) { sidebarBottomBar }
+    }
+
+    /// 一份汇总：点标题看汇总并展开；左边的箭头一直显示，点它展开或收起包含的视频（原记录被删的不列）。
+    /// 不用 DisclosureGroup：侧栏里它的箭头只在鼠标悬停时出现，看不出能展开
+    @ViewBuilder
+    private func digestGroup(_ digest: DigestRecord) -> some View {
+        let expanded = expandedDigests.contains(digest.id)
+        HStack(spacing: 4) {
+            Button {
+                if expanded { expandedDigests.remove(digest.id) } else { expandedDigests.insert(digest.id) }
+            } label: {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(expanded ? 90 : 0))
+                    .frame(width: 14, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .help(expanded ? "收起" : "展开这份汇总包含的视频")
+            .accessibilityLabel(expanded ? "收起" : "展开")
+
+            // 两行都放进 Label 的标题里，第二行才和标题左对齐，不会缩到图标下面
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(TitleFormatter.display(digest.title))
+                        .lineLimit(1)
+                    Text("\(digest.recordIDs.count) 个视频 · \(digest.date.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: "sparkles")
+            }
+        }
+        .help(digest.title)
+        .tag(SidebarItem.digest(digest.id))
+        .contextMenu {
+            Button("删除汇总", role: .destructive) {
+                digests.delete(digest)
+                if appState.selection == .digest(digest.id) {
+                    appState.selection = nil
+                }
+            }
+        }
+
+        if expanded {
+            ForEach(digest.recordIDs.compactMap { id in history.records.first { $0.id == id } }) { record in
+                historyRow(record)
+                    .padding(.leading, 18)
+            }
+        }
     }
 
     @ViewBuilder

@@ -2,13 +2,43 @@ import Foundation
 import WhisperKit
 
 /// 串联 下载 → 解码 → 转写 → 说话人分离 的总调度。
-/// 任务串行执行（转写/分离都吃 ANE/GPU，串行内存可控）。
+/// 下载和转写是两条队列，各自一次只做一个：下载同时开太多会被平台限流；转写吃 ANE/GPU，串行内存可控。
+/// 转写当前视频时，后面的视频先下载，最多提前 prefetchAhead 个，下载时间基本不占总时长。
 @MainActor
 final class PipelineCoordinator: ObservableObject {
+    /// 下载阶段的结果：已经结束（用上了字幕、失败或取消），或拿到了待转写的媒体文件
+    private enum Fetched {
+        case finished
+        case media(parts: [MediaPart], warning: String?)
+    }
+
     private let transcriber = Transcriber()
     private let diarizer = Diarizer()
-    private var runningTasks: [UUID: Task<Void, Never>] = [:]
+    private var runningTasks: [UUID: (fetch: Task<Fetched, Never>, transcribe: Task<Void, Never>)] = [:]
+    private var fetchTail: Task<Fetched, Never>?
     private var queueTail: Task<Void, Never>?
+    /// 已下载、等待转写的视频最多几个（控制占用的磁盘）
+    private static let prefetchAhead = 2
+    /// 下好的音频占的名额：正在转写的一个加提前下载的 prefetchAhead 个。
+    /// 只有真下载了音频的任务占名额，用上字幕、失败、取消的不占
+    private var freeMediaSlots = prefetchAhead + 1
+    private var slotWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private func acquireMediaSlot() async {
+        if freeMediaSlots > 0 {
+            freeMediaSlots -= 1
+            return
+        }
+        await withCheckedContinuation { slotWaiters.append($0) }
+    }
+
+    private func releaseMediaSlot() {
+        if slotWaiters.isEmpty {
+            freeMediaSlots += 1
+        } else {
+            slotWaiters.removeFirst().resume()
+        }
+    }
 
     var historyStore: HistoryStore?
 
@@ -18,14 +48,24 @@ final class PipelineCoordinator: ObservableObject {
     ]
 
     func enqueue(_ task: TranscriptionTask, settings: AppSettings) {
-        let previous = queueTail
-        let job = Task { [weak self] in
-            _ = await previous?.value
-            guard let self, !task.cancelFlag.isCancelled else { return }
-            await self.process(task, settings: settings)
+        // 下载：一次一个，等上一个下载完（下载前还要等有空名额，见 fetch）
+        let previousFetch = fetchTail
+        let fetchJob = Task { [weak self] () -> Fetched in
+            _ = await previousFetch?.value
+            guard let self, !task.cancelFlag.isCancelled else { return .finished }
+            return await self.fetch(task, settings: settings)
         }
-        queueTail = job
-        runningTasks[task.id] = job
+        // 转写：等自己的下载和上一个转写都结束
+        let previousTranscribe = queueTail
+        let transcribeJob = Task { [weak self] in
+            let fetched = await fetchJob.value
+            _ = await previousTranscribe?.value
+            guard let self else { return }
+            await self.transcribe(task, fetched: fetched, settings: settings)
+        }
+        fetchTail = fetchJob
+        queueTail = transcribeJob
+        runningTasks[task.id] = (fetchJob, transcribeJob)
     }
 
     /// 等到当前已排队的任务全部结束（之后再排队的不等）
@@ -34,30 +74,93 @@ final class PipelineCoordinator: ObservableObject {
     }
 
     func cancel(_ task: TranscriptionTask) {
+        // 已下好、还没开始转写的，音频现在就删；正在下载的由下载那边收尾，不能边写边删
+        let downloadedOnly = task.stage == .downloaded
         task.cancelFlag.cancel()
-        runningTasks[task.id]?.cancel()
+        if let jobs = runningTasks[task.id] {
+            jobs.fetch.cancel()
+            jobs.transcribe.cancel()
+        }
         runningTasks[task.id] = nil
         if !task.stage.isFinished {
             task.stage = .cancelled
         }
+        if downloadedOnly {
+            try? FileManager.default.removeItem(at: Self.taskDirectory(for: task))
+        }
     }
 
-    private func process(_ task: TranscriptionTask, settings: AppSettings) async {
-        let taskDir = AppPaths.downloads.appendingPathComponent(task.id.uuidString)
+    /// 启动时清掉上次退出时没转写完留下的音频（只删以任务编号命名的目录，冒烟测试的样例不动）
+    static func removeLeftoverDownloads() {
+        let fm = FileManager.default
+        let entries = (try? fm.contentsOfDirectory(at: AppPaths.downloads, includingPropertiesForKeys: nil)) ?? []
+        for entry in entries where UUID(uuidString: entry.lastPathComponent) != nil {
+            try? fm.removeItem(at: entry)
+        }
+    }
+
+    private static func taskDirectory(for task: TranscriptionTask) -> URL {
+        AppPaths.downloads.appendingPathComponent(task.id.uuidString)
+    }
+
+    private func markFailure(_ task: TranscriptionTask, _ error: Error) {
+        if error is CancellationError || task.cancelFlag.isCancelled {
+            task.stage = .cancelled
+        } else {
+            task.stage = .failed(error.localizedDescription)
+        }
+    }
+
+    /// 下载阶段：先试平台字幕（用上了就直接完成），再下载音频
+    private func fetch(_ task: TranscriptionTask, settings: AppSettings) async -> Fetched {
+        let taskDir = Self.taskDirectory(for: task)
+        do {
+            // 有平台字幕就直接用，跳过下载和转写（B 站需配置 cookies 才有 AI 字幕）
+            if try await useSubtitlesIfAvailable(for: task, into: taskDir, settings: settings) {
+                return .finished
+            }
+            // 本地文件不用下载，不占名额
+            guard case .remote = task.source else {
+                let (parts, warning) = try await fetchMedia(for: task, into: taskDir, settings: settings)
+                return .media(parts: parts, warning: warning)
+            }
+            // 拿到本地媒体文件（B 站分P视频每P一个）。先等有空名额，免得一口气全下完
+            await acquireMediaSlot()
+            do {
+                try Task.checkCancellation()
+                guard !task.cancelFlag.isCancelled else { throw CancellationError() }
+                let (parts, warning) = try await fetchMedia(for: task, into: taskDir, settings: settings)
+                try Task.checkCancellation()
+                task.stage = .downloaded
+                return .media(parts: parts, warning: warning)
+            } catch {
+                releaseMediaSlot()
+                throw error
+            }
+        } catch {
+            markFailure(task, error)
+            try? FileManager.default.removeItem(at: taskDir)
+            return .finished
+        }
+    }
+
+    /// 转写阶段：逐P解码、转写、分离说话人；无论成败都清理这个任务的临时文件
+    private func transcribe(_ task: TranscriptionTask, fetched: Fetched, settings: AppSettings) async {
+        let taskDir = Self.taskDirectory(for: task)
+        guard case let .media(parts, warning) = fetched else {
+            runningTasks[task.id] = nil
+            try? FileManager.default.removeItem(at: taskDir)
+            return
+        }
         defer {
             runningTasks[task.id] = nil
             try? FileManager.default.removeItem(at: taskDir)
+            // 下载的音频转写完（或放弃）就让出名额
+            if case .remote = task.source { releaseMediaSlot() }
         }
+        guard !task.cancelFlag.isCancelled else { return }
 
         do {
-            // 0. 有平台字幕就直接用，跳过下载和转写（B 站需配置 cookies 才有 AI 字幕）
-            if try await useSubtitlesIfAvailable(for: task, into: taskDir, settings: settings) {
-                return
-            }
-
-            // 1. 拿到本地媒体文件（B 站分P视频每P一个）
-            let (parts, warning) = try await fetchMedia(for: task, into: taskDir, settings: settings)
-            try Task.checkCancellation()
             // 分P视频（哪怕只剩一P能下）每P开头标标题
             let showMarkers = parts.contains { !$0.label.isEmpty }
 
@@ -187,14 +290,8 @@ final class PipelineCoordinator: ObservableObject {
             try Task.checkCancellation()
             task.stage = .completed
             historyStore?.save(task: task)
-        } catch is CancellationError {
-            task.stage = .cancelled
         } catch {
-            if task.cancelFlag.isCancelled {
-                task.stage = .cancelled
-            } else {
-                task.stage = .failed(error.localizedDescription)
-            }
+            markFailure(task, error)
         }
     }
 
