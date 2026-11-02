@@ -19,7 +19,9 @@ enum SummarizerError: LocalizedError {
 
 /// 调用本机 Claude Code 命令行（claude -p）写总结，用的是用户自己的登录账号和额度
 enum Summarizer {
-    static let model = "sonnet"
+    /// 写明完整型号：别名 sonnet 在当前命令行版本里对应的是旧版 4.6
+    static let model = "claude-sonnet-5-5"
+    static let modelDisplayName = "Sonnet 5.5"
 
     static let videoPrompt = """
     你会收到一个视频的元信息和文稿。文稿来自字幕或语音识别，可能有错别字和同音误识别。

@@ -107,7 +107,7 @@ struct SettingsView: View {
             } header: {
                 Text("总结（Claude）")
             } footer: {
-                Text("总结调用本机 Claude Code 的命令行版，用你自己的账号和额度，默认 \(Summarizer.model) 模型。提示未登录时，在终端运行 claude auth login。")
+                Text("总结调用本机 Claude Code 的命令行版，用你自己的账号和额度，使用 \(Summarizer.modelDisplayName) 模型。提示未登录时，在终端运行 claude auth login。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
