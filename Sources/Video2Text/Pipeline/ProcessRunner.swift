@@ -4,6 +4,8 @@ struct ProcessResult {
     let exitCode: Int32
     let stdout: String
     let stderr: String
+    /// 超时被本程序结束（退出码因程序而异，不能靠它判断）
+    var timedOut = false
 }
 
 enum ProcessRunnerError: LocalizedError {
@@ -25,6 +27,8 @@ enum ProcessRunner {
         _ executable: URL,
         arguments: [String],
         currentDirectory: URL? = nil,
+        environment: [String: String]? = nil,
+        standardInputFile: URL? = nil,
         timeout: TimeInterval? = nil,
         onStdoutLine: (@Sendable (String) -> Void)? = nil
     ) async throws -> ProcessResult {
@@ -32,6 +36,11 @@ enum ProcessRunner {
         process.executableURL = executable
         process.arguments = arguments
         if let currentDirectory { process.currentDirectoryURL = currentDirectory }
+        if let environment { process.environment = environment }
+        // 用文件做 stdin：内容大于管道缓冲区时也不会阻塞写入方
+        if let standardInputFile {
+            process.standardInput = try FileHandle(forReadingFrom: standardInputFile)
+        }
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -53,7 +62,8 @@ enum ProcessRunner {
                     continuation.resume(returning: ProcessResult(
                         exitCode: state.exitCode,
                         stdout: stdoutCollector.text,
-                        stderr: stderrCollector.text
+                        stderr: stderrCollector.text,
+                        timedOut: state.timedOut
                     ))
                 }
 
@@ -79,7 +89,10 @@ enum ProcessRunner {
                 }
 
                 let timeoutTimer: DispatchWorkItem? = timeout.map { seconds in
-                    let item = DispatchWorkItem { state.terminateIfRunning(process) }
+                    let item = DispatchWorkItem {
+                        state.markTimedOut()
+                        state.terminateIfRunning(process)
+                    }
                     DispatchQueue.global().asyncAfter(deadline: .now() + seconds, execute: item)
                     return item
                 }
@@ -128,6 +141,16 @@ private final class ProcessRunState: @unchecked Sendable {
     private var stderrEOF = false
     private var terminated = false
     private var storedExitCode: Int32 = 0
+    private var didTimeOut = false
+
+    var timedOut: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return didTimeOut
+    }
+
+    func markTimedOut() {
+        lock.lock(); didTimeOut = true; lock.unlock()
+    }
 
     var exitCode: Int32 {
         lock.lock(); defer { lock.unlock() }

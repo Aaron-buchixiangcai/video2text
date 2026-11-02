@@ -32,6 +32,7 @@ enum TranscriptExporter {
         guard showTimestamps || showSpeakers else { return transcript.plainText }
         let source = showSpeakers ? transcript.coalesced().utterances : transcript.utterances
         return source.map { u in
+            if u.isMarker { return u.text }
             let time = showTimestamps ? "[\(formatTimestamp(u.start))] " : ""
             let speaker = showSpeakers ? ((u.speaker.map { "说话人\($0 + 1)" } ?? "未知") + "：") : ""
             return time + speaker + u.text
@@ -57,8 +58,27 @@ enum TranscriptExporter {
         }
     }
 
+    /// 字幕用的条目：去掉分P标题行；分P视频每P时间从 0 起算，字幕里接着前一P往后排，保证时间递增
+    private static func subtitleCues(_ transcript: Transcript) -> [Utterance] {
+        var cues: [Utterance] = []
+        var offset = 0.0
+        var latestEnd = 0.0
+        for u in transcript.utterances {
+            if u.isMarker {
+                offset = latestEnd
+                continue
+            }
+            var cue = u
+            cue.start += offset
+            cue.end += offset
+            latestEnd = max(latestEnd, cue.end)
+            cues.append(cue)
+        }
+        return cues
+    }
+
     static func srt(_ transcript: Transcript, includeSpeaker: Bool) -> String {
-        transcript.utterances.enumerated().map { index, u in
+        subtitleCues(transcript).enumerated().map { index, u in
             let speaker = includeSpeaker
                 ? (u.speaker.map { "说话人\($0 + 1)：" } ?? "")
                 : ""
@@ -71,7 +91,7 @@ enum TranscriptExporter {
     }
 
     static func vtt(_ transcript: Transcript, includeSpeaker: Bool) -> String {
-        let cues = transcript.utterances.map { u in
+        let cues = subtitleCues(transcript).map { u in
             let speaker = includeSpeaker
                 ? (u.speaker.map { "说话人\($0 + 1)：" } ?? "")
                 : ""
@@ -87,12 +107,21 @@ enum TranscriptExporter {
         var lines = ["# 文字稿", ""]
         if diarized {
             for u in transcript.coalesced().utterances {
+                if u.isMarker {
+                    lines.append("## \(u.text)")
+                    lines.append("")
+                    continue
+                }
                 let label = u.speaker.map { "说话人\($0 + 1)" } ?? "未知"
                 lines.append("**\(label)**（\(formatTimestamp(u.start))）：\(u.text)")
                 lines.append("")
             }
         } else {
             for u in transcript.utterances {
+                if u.isMarker {
+                    lines.append(contentsOf: ["", "## \(u.text)", ""])
+                    continue
+                }
                 lines.append("- `\(formatTimestamp(u.start))` \(u.text)")
             }
         }

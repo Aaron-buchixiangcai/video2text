@@ -9,19 +9,34 @@ final class TranscriptTogglesStore: ObservableObject {
         var showSpeakers = true
     }
 
-    @Published private var store: [UUID: Toggles] = [:]
-
-    func toggles(for id: UUID) -> Toggles {
-        store[id] ?? Toggles()
+    /// 两个开关各自记录「用户是否手动切过」；没切过的那个跟随默认值，切一个不会把另一个的默认值固定下来
+    private struct Overrides {
+        var showTimestamps: Bool?
+        var showSpeakers: Bool?
     }
 
-    func binding(for id: UUID, keyPath: WritableKeyPath<Toggles, Bool>) -> Binding<Bool> {
+    @Published private var store: [UUID: Overrides] = [:]
+
+    /// speakersDefault：没手动切过时「分发言人」的初始状态（只有一位说话人时默认关）
+    func toggles(for id: UUID, speakersDefault: Bool = true) -> Toggles {
+        let overrides = store[id]
+        return Toggles(
+            showTimestamps: overrides?.showTimestamps ?? false,
+            showSpeakers: overrides?.showSpeakers ?? speakersDefault
+        )
+    }
+
+    func binding(for id: UUID, keyPath: WritableKeyPath<Toggles, Bool>, speakersDefault: Bool = true) -> Binding<Bool> {
         Binding(
-            get: { (self.store[id] ?? Toggles())[keyPath: keyPath] },
+            get: { self.toggles(for: id, speakersDefault: speakersDefault)[keyPath: keyPath] },
             set: { newValue in
-                var current = self.store[id] ?? Toggles()
-                current[keyPath: keyPath] = newValue
-                self.store[id] = current
+                var overrides = self.store[id] ?? Overrides()
+                if keyPath == \Toggles.showTimestamps {
+                    overrides.showTimestamps = newValue
+                } else {
+                    overrides.showSpeakers = newValue
+                }
+                self.store[id] = overrides
             }
         )
     }

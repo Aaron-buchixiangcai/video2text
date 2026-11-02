@@ -15,11 +15,13 @@ enum AppPaths {
     static var history: URL { root.appendingPathComponent("history", isDirectory: true) }
     /// 下载中转目录（任务完成后清理）
     static var downloads: URL { root.appendingPathComponent("downloads", isDirectory: true) }
+    /// 多条转写的汇总报告 JSON
+    static var digests: URL { root.appendingPathComponent("digests", isDirectory: true) }
 
     static var ytDlp: URL { bin.appendingPathComponent("yt-dlp") }
 
     static func ensureAll() {
-        for dir in [root, models, bin, history, downloads] {
+        for dir in [root, models, bin, history, downloads, digests] {
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
     }

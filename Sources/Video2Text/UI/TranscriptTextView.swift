@@ -3,6 +3,8 @@ import SwiftUI
 
 struct TranscriptTextView: NSViewRepresentable {
     let text: String
+    /// 总结、汇总是 Markdown，排成带标题层级的富文本；文字稿按纯文本显示，分P标题行加粗
+    var markdown = false
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -24,7 +26,9 @@ struct TranscriptTextView: NSViewRepresentable {
         textView.drawsBackground = false
         textView.usesFindPanel = true
         textView.allowsUndo = false
-        textView.textContainerInset = NSSize(width: 16, height: 16)
+        // 左右边距与上方工具栏、输入栏的 10pt 对齐
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainerInset = NSSize(width: 10, height: 14)
         textView.isHorizontallyResizable = false
         textView.isVerticallyResizable = true
         textView.autoresizingMask = [.width]
@@ -33,8 +37,6 @@ struct TranscriptTextView: NSViewRepresentable {
             width: scrollView.contentSize.width,
             height: CGFloat.greatestFiniteMagnitude
         )
-        applyStyle(to: textView)
-
         scrollView.documentView = textView
         context.coordinator.textView = textView
         return scrollView
@@ -44,21 +46,36 @@ struct TranscriptTextView: NSViewRepresentable {
         guard let textView = context.coordinator.textView ?? scrollView.documentView as? NSTextView else {
             return
         }
-        applyStyle(to: textView)
-        if context.coordinator.currentText != text {
-            context.coordinator.currentText = text
-            textView.string = text
+        let key = (markdown ? "md:" : "txt:") + text
+        if context.coordinator.currentKey != key {
+            context.coordinator.currentKey = key
+            textView.textStorage?.setAttributedString(markdown ? MarkdownRenderer.render(text) : Self.plain(text))
             textView.scrollToBeginningOfDocument(nil)
         }
     }
 
-    private func applyStyle(to textView: NSTextView) {
-        textView.font = .systemFont(ofSize: NSFont.systemFontSize)
-        textView.textColor = .labelColor
+    private static let partTitle = try! NSRegularExpression(pattern: #"^【P\d+】.*$"#, options: .anchorsMatchLines)
+
+    private static func plain(_ text: String) -> NSAttributedString {
+        let size = NSFont.systemFontSize
+        let result = NSMutableAttributedString(
+            string: text,
+            attributes: [.font: NSFont.systemFont(ofSize: size), .foregroundColor: NSColor.labelColor]
+        )
+        let spaced = NSMutableParagraphStyle()
+        spaced.paragraphSpacingBefore = 10
+        spaced.paragraphSpacing = 2
+        for match in partTitle.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+            result.addAttributes(
+                [.font: NSFont.systemFont(ofSize: size + 1, weight: .bold), .paragraphStyle: spaced],
+                range: match.range
+            )
+        }
+        return result
     }
 
     final class Coordinator {
         weak var textView: NSTextView?
-        var currentText = ""
+        var currentKey = ""
     }
 }

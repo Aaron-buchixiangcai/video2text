@@ -7,6 +7,18 @@ struct Utterance: Codable, Identifiable, Hashable {
     var start: Double
     var end: Double
     var text: String
+    /// B 站分P视频每P开头的标题行；不是语音，不参与合并、不标说话人。旧记录里没有这个字段
+    var isPartMarker: Bool?
+
+    /// 旧版本存下的多P记录没有 isPartMarker，按「【P数字】」开头且无说话人识别
+    var isMarker: Bool {
+        isPartMarker == true
+            || (speaker == nil && text.range(of: #"^【P\d+】"#, options: .regularExpression) != nil)
+    }
+
+    static func partMarker(_ label: String) -> Utterance {
+        Utterance(speaker: nil, start: 0, end: 0, text: label, isPartMarker: true)
+    }
 }
 
 struct Transcript: Codable, Hashable {
@@ -25,6 +37,7 @@ struct Transcript: Codable, Hashable {
         var merged: [Utterance] = []
         for u in utterances {
             if var last = merged.last,
+               !last.isMarker, !u.isMarker,
                last.speaker == u.speaker,
                u.start - last.end < maxGap {
                 last.end = u.end

@@ -7,6 +7,10 @@ struct HistoryRecord: Codable, Identifiable, Hashable {
     var date: Date
     var transcript: Transcript
     var diarized: Bool
+    // 以下为后加字段，旧记录里没有，解码时为 nil
+    var transcriptSource: TranscriptSource?
+    /// Claude 生成的单篇总结（Markdown）
+    var summary: String?
 }
 
 /// 历史记录：每条一个 JSON 文件，存 App Support/Video2Text/history/
@@ -41,11 +45,14 @@ final class HistoryStore: ObservableObject {
             source: task.source.displayName,
             date: task.createdAt,
             transcript: transcript,
-            diarized: task.diarized
+            diarized: task.diarized,
+            transcriptSource: task.transcriptSource
         )
         persist(record)
         records.removeAll { $0.id == record.id }
-        records.insert(record, at: 0)
+        // 按提交时间倒序插入：边转边下时，后提交的视频（例如直接用了字幕）可能先完成
+        let index = records.firstIndex { $0.date < record.date } ?? records.endIndex
+        records.insert(record, at: index)
     }
 
     func delete(_ record: HistoryRecord) {
@@ -65,6 +72,12 @@ final class HistoryStore: ObservableObject {
         guard !trimmed.isEmpty,
               let idx = records.firstIndex(where: { $0.id == record.id }) else { return }
         records[idx].title = trimmed
+        persist(records[idx])
+    }
+
+    func setSummary(_ summary: String, for id: UUID) {
+        guard let idx = records.firstIndex(where: { $0.id == id }) else { return }
+        records[idx].summary = summary
         persist(records[idx])
     }
 

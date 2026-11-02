@@ -3,11 +3,13 @@ import Foundation
 enum YtDlpError: LocalizedError {
     case notInstalled
     case downloadFailed(String)
+    case updateFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .notInstalled: return "yt-dlp 尚未安装"
         case let .downloadFailed(reason): return "yt-dlp 下载失败：\(reason)"
+        case let .updateFailed(reason): return reason
         }
     }
 }
@@ -47,11 +49,15 @@ enum YtDlpManager {
         return dest
     }
 
-    /// yt-dlp -U 自更新（仅对独立二进制有效）
-    static func update() async throws -> String {
+    /// yt-dlp -U 自更新（仅对独立二进制有效；Homebrew 装的会报错，提示用 brew 更新）
+    static func update() async throws {
         guard let binary = locate() else { throw YtDlpError.notInstalled }
         let result = try await ProcessRunner.run(binary, arguments: ["-U"], timeout: 300)
-        return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard result.exitCode == 0 else {
+            let last = result.stderr.split(whereSeparator: \.isNewline).last.map(String.init) ?? ""
+            let reason = last.replacingOccurrences(of: "ERROR: ", with: "")
+            throw YtDlpError.updateFailed(reason.isEmpty ? "退出码 \(result.exitCode)" : reason)
+        }
     }
 
     static func version() async -> String? {

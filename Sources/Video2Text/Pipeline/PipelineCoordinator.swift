@@ -2,13 +2,43 @@ import Foundation
 import WhisperKit
 
 /// 串联 下载 → 解码 → 转写 → 说话人分离 的总调度。
-/// 任务串行执行（转写/分离都吃 ANE/GPU，串行内存可控）。
+/// 下载和转写是两条队列，各自一次只做一个：下载同时开太多会被平台限流；转写吃 ANE/GPU，串行内存可控。
+/// 转写当前视频时，后面的视频先下载，最多提前 prefetchAhead 个，下载时间基本不占总时长。
 @MainActor
 final class PipelineCoordinator: ObservableObject {
+    /// 下载阶段的结果：已经结束（用上了字幕、失败或取消），或拿到了待转写的媒体文件
+    private enum Fetched {
+        case finished
+        case media(parts: [MediaPart], warning: String?)
+    }
+
     private let transcriber = Transcriber()
     private let diarizer = Diarizer()
-    private var runningTasks: [UUID: Task<Void, Never>] = [:]
+    private var runningTasks: [UUID: (fetch: Task<Fetched, Never>, transcribe: Task<Void, Never>)] = [:]
+    private var fetchTail: Task<Fetched, Never>?
     private var queueTail: Task<Void, Never>?
+    /// 已下载、等待转写的视频最多几个（控制占用的磁盘）
+    private static let prefetchAhead = 2
+    /// 下好的音频占的名额：正在转写的一个加提前下载的 prefetchAhead 个。
+    /// 只有真下载了音频的任务占名额，用上字幕、失败、取消的不占
+    private var freeMediaSlots = prefetchAhead + 1
+    private var slotWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private func acquireMediaSlot() async {
+        if freeMediaSlots > 0 {
+            freeMediaSlots -= 1
+            return
+        }
+        await withCheckedContinuation { slotWaiters.append($0) }
+    }
+
+    private func releaseMediaSlot() {
+        if slotWaiters.isEmpty {
+            freeMediaSlots += 1
+        } else {
+            slotWaiters.removeFirst().resume()
+        }
+    }
 
     var historyStore: HistoryStore?
 
@@ -18,134 +48,296 @@ final class PipelineCoordinator: ObservableObject {
     ]
 
     func enqueue(_ task: TranscriptionTask, settings: AppSettings) {
-        let previous = queueTail
-        let job = Task { [weak self] in
-            _ = await previous?.value
-            guard let self, !task.cancelFlag.isCancelled else { return }
-            await self.process(task, settings: settings)
+        // 下载：一次一个，等上一个下载完（下载前还要等有空名额，见 fetch）
+        let previousFetch = fetchTail
+        let fetchJob = Task { [weak self] () -> Fetched in
+            _ = await previousFetch?.value
+            guard let self, !task.cancelFlag.isCancelled else { return .finished }
+            return await self.fetch(task, settings: settings)
         }
-        queueTail = job
-        runningTasks[task.id] = job
+        // 转写：等自己的下载和上一个转写都结束
+        let previousTranscribe = queueTail
+        let transcribeJob = Task { [weak self] in
+            let fetched = await fetchJob.value
+            _ = await previousTranscribe?.value
+            guard let self else { return }
+            await self.transcribe(task, fetched: fetched, settings: settings)
+        }
+        fetchTail = fetchJob
+        queueTail = transcribeJob
+        runningTasks[task.id] = (fetchJob, transcribeJob)
+    }
+
+    /// 等到当前已排队的任务全部结束（之后再排队的不等）
+    func waitForQueue() async {
+        await queueTail?.value
     }
 
     func cancel(_ task: TranscriptionTask) {
+        // 已下好、还没开始转写的，音频现在就删；正在下载的由下载那边收尾，不能边写边删
+        let downloadedOnly = task.stage == .downloaded
         task.cancelFlag.cancel()
-        runningTasks[task.id]?.cancel()
+        if let jobs = runningTasks[task.id] {
+            jobs.fetch.cancel()
+            jobs.transcribe.cancel()
+        }
         runningTasks[task.id] = nil
         if !task.stage.isFinished {
             task.stage = .cancelled
         }
+        if downloadedOnly {
+            try? FileManager.default.removeItem(at: Self.taskDirectory(for: task))
+        }
     }
 
-    private func process(_ task: TranscriptionTask, settings: AppSettings) async {
-        let taskDir = AppPaths.downloads.appendingPathComponent(task.id.uuidString)
+    /// 启动时清掉上次退出时没转写完留下的音频（只删以任务编号命名的目录，冒烟测试的样例不动）
+    static func removeLeftoverDownloads() {
+        let fm = FileManager.default
+        let entries = (try? fm.contentsOfDirectory(at: AppPaths.downloads, includingPropertiesForKeys: nil)) ?? []
+        for entry in entries where UUID(uuidString: entry.lastPathComponent) != nil {
+            try? fm.removeItem(at: entry)
+        }
+    }
+
+    private static func taskDirectory(for task: TranscriptionTask) -> URL {
+        AppPaths.downloads.appendingPathComponent(task.id.uuidString)
+    }
+
+    private func markFailure(_ task: TranscriptionTask, _ error: Error) {
+        if error is CancellationError || task.cancelFlag.isCancelled {
+            task.stage = .cancelled
+        } else {
+            task.stage = .failed(error.localizedDescription)
+        }
+    }
+
+    /// 下载阶段：先试平台字幕（用上了就直接完成），再下载音频
+    private func fetch(_ task: TranscriptionTask, settings: AppSettings) async -> Fetched {
+        let taskDir = Self.taskDirectory(for: task)
+        do {
+            // 有平台字幕就直接用，跳过下载和转写（B 站需配置 cookies 才有 AI 字幕）
+            if try await useSubtitlesIfAvailable(for: task, into: taskDir, settings: settings) {
+                return .finished
+            }
+            // 本地文件不用下载，不占名额
+            guard case .remote = task.source else {
+                let (parts, warning) = try await fetchMedia(for: task, into: taskDir, settings: settings)
+                return .media(parts: parts, warning: warning)
+            }
+            // 拿到本地媒体文件（B 站分P视频每P一个）。先等有空名额，免得一口气全下完
+            await acquireMediaSlot()
+            do {
+                try Task.checkCancellation()
+                guard !task.cancelFlag.isCancelled else { throw CancellationError() }
+                let (parts, warning) = try await fetchMedia(for: task, into: taskDir, settings: settings)
+                try Task.checkCancellation()
+                task.stage = .downloaded
+                return .media(parts: parts, warning: warning)
+            } catch {
+                releaseMediaSlot()
+                throw error
+            }
+        } catch {
+            markFailure(task, error)
+            try? FileManager.default.removeItem(at: taskDir)
+            return .finished
+        }
+    }
+
+    /// 转写阶段：逐P解码、转写、分离说话人；无论成败都清理这个任务的临时文件
+    private func transcribe(_ task: TranscriptionTask, fetched: Fetched, settings: AppSettings) async {
+        let taskDir = Self.taskDirectory(for: task)
+        guard case let .media(parts, warning) = fetched else {
+            runningTasks[task.id] = nil
+            try? FileManager.default.removeItem(at: taskDir)
+            return
+        }
         defer {
             runningTasks[task.id] = nil
             try? FileManager.default.removeItem(at: taskDir)
+            // 下载的音频转写完（或放弃）就让出名额
+            if case .remote = task.source { releaseMediaSlot() }
         }
+        guard !task.cancelFlag.isCancelled else { return }
 
         do {
-            // 1. 拿到本地媒体文件
-            let mediaURL = try await fetchMedia(for: task, into: taskDir, settings: settings)
-            try Task.checkCancellation()
+            // 分P视频（哪怕只剩一P能下）每P开头标标题
+            let showMarkers = parts.contains { !$0.label.isEmpty }
 
-            // 2. 解码 PCM
-            task.stage = .extracting
-            let audio = try await AudioExtractor.pcm(from: mediaURL)
-            guard !audio.isEmpty else { throw AudioExtractorError.noAudioTrack }
-            try Task.checkCancellation()
-
-            // 3. 加载模型（带下载进度）
-            task.stage = .loadingModel(0)
-            try await transcriber.load(
-                model: settings.model,
-                downloadProgress: { progress in
-                    Task { @MainActor in
-                        if case .loadingModel = task.stage {
-                            task.stage = .loadingModel(progress.fractionCompleted)
-                        }
-                    }
+            // 2–5 逐P做：内存只取决于最长的一P；每P的时间从 00:00 起算，与该P视频的进度一致；
+            // 说话人在每P内单独编号
+            let partCount = Double(parts.count)
+            var finished: [Utterance] = warning.map { [Utterance.partMarker("【提示】\($0)")] } ?? []
+            var language: String?
+            var speakerCount: Int?
+            var modelLoaded = false
+            var transcribedAny = false
+            var lastPartError: Error?
+            for (index, part) in parts.enumerated() {
+                let marker = showMarkers ? [Utterance.partMarker(part.label)] : []
+                let overall: @Sendable (Double) -> Double = { (Double(index) + $0) / partCount }
+                /// 多P里某一P解码或转写失败时只留标题并注明原因，继续下一P，已完成的P不丢
+                func skipFailedPart(_ error: Error) throws {
+                    if error is CancellationError || task.cancelFlag.isCancelled || parts.count == 1 { throw error }
+                    NSLog("第 \(index + 1) P 处理失败: \(error.localizedDescription)")
+                    lastPartError = error
+                    finished.append(.partMarker("\(part.label)（这一P处理失败：\(error.localizedDescription)）"))
                 }
-            )
-            try Task.checkCancellation()
 
-            // 4. 转写
-            task.stage = .transcribing(0)
-            let cancelFlag = task.cancelFlag
-            let results = try await transcriber.transcribe(
-                audio,
-                language: settings.languageOrNil,
-                cancelFlag: cancelFlag,
-                progress: { fraction in
-                    Task { @MainActor in
-                        if case .transcribing = task.stage {
-                            task.stage = .transcribing(fraction)
-                        }
-                    }
-                }
-            )
-            try Task.checkCancellation()
-
-            // 转写结果先展示（不带说话人）
-            let plain = Self.transcript(from: results).simplifiedChinese()
-            task.transcript = plain
-
-            // 5. 说话人分离（失败不影响已有转写结果）
-            if settings.diarizationEnabled {
-                task.stage = .diarizing(0)
+                // 2. 解码 PCM
+                task.stage = .extracting
+                let audio: [Float]
                 do {
-                    try await diarizer.load(
+                    audio = try await AudioExtractor.pcm(from: part.fileURL)
+                    try Task.checkCancellation()
+                    guard !audio.isEmpty else { throw AudioExtractorError.noAudioTrack }
+                } catch {
+                    try skipFailedPart(error)
+                    continue
+                }
+
+                // 3. 加载模型（带下载进度）
+                if !modelLoaded {
+                    task.stage = .loadingModel(0)
+                    try await transcriber.load(
+                        model: settings.model,
                         downloadProgress: { progress in
                             Task { @MainActor in
-                                if case .diarizing = task.stage {
-                                    task.stage = .diarizing(progress.fractionCompleted * 0.2)
+                                if case .loadingModel = task.stage {
+                                    task.stage = .loadingModel(progress.fractionCompleted)
                                 }
                             }
                         }
                     )
-                    let labeled = try await diarizer.diarizedTranscript(
-                        audio: audio,
-                        transcription: results,
+                    modelLoaded = true
+                    try Task.checkCancellation()
+                }
+
+                // 4. 转写
+                task.stage = .transcribing(overall(0))
+                let cancelFlag = task.cancelFlag
+                let results: [TranscriptionResult]
+                do {
+                    results = try await transcriber.transcribe(
+                        audio,
+                        language: settings.languageOrNil,
+                        cancelFlag: cancelFlag,
                         progress: { fraction in
                             Task { @MainActor in
-                                if case .diarizing = task.stage {
-                                    task.stage = .diarizing(0.2 + fraction * 0.8)
+                                if case .transcribing = task.stage {
+                                    task.stage = .transcribing(overall(fraction))
                                 }
                             }
                         }
                     )
-                    task.transcript = labeled.coalesced().simplifiedChinese()
-                    task.diarized = true
-                } catch is CancellationError {
-                    throw CancellationError()
+                    try Task.checkCancellation()
                 } catch {
-                    // 保留纯转写结果，仅记录分离失败
-                    NSLog("说话人分离失败: \(error.localizedDescription)")
+                    try skipFailedPart(error)
+                    continue
                 }
+                transcribedAny = true
+                language = language ?? results.first?.language
+
+                // 转写结果先展示（不带说话人）
+                let plain = Self.transcript(from: results).simplifiedChinese()
+                var partUtterances = plain.utterances
+                task.transcript = Transcript(
+                    utterances: finished + marker + partUtterances, language: language, speakerCount: speakerCount
+                )
+
+                // 5. 说话人分离（失败不影响已有转写结果）
+                if settings.diarizationEnabled {
+                    task.stage = .diarizing(overall(0))
+                    do {
+                        try await diarizer.load(
+                            downloadProgress: { progress in
+                                Task { @MainActor in
+                                    if case .diarizing = task.stage {
+                                        task.stage = .diarizing(overall(progress.fractionCompleted * 0.2))
+                                    }
+                                }
+                            }
+                        )
+                        let labeled = try await diarizer.diarizedTranscript(
+                            audio: audio,
+                            transcription: results,
+                            progress: { fraction in
+                                Task { @MainActor in
+                                    if case .diarizing = task.stage {
+                                        task.stage = .diarizing(overall(0.2 + fraction * 0.8))
+                                    }
+                                }
+                            }
+                        )
+                        let merged = labeled.coalesced().simplifiedChinese()
+                        partUtterances = merged.utterances
+                        speakerCount = max(speakerCount ?? 0, merged.speakerCount ?? 0)
+                        task.diarized = true
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        // 保留纯转写结果，仅记录分离失败
+                        NSLog("说话人分离失败: \(error.localizedDescription)")
+                    }
+                }
+                finished += marker + partUtterances
+                task.transcript = Transcript(utterances: finished, language: language, speakerCount: speakerCount)
             }
+            guard transcribedAny else { throw lastPartError ?? AudioExtractorError.noAudioTrack }
+            // 末尾失败或无声的P的标题行也要进最终文字稿
+            task.transcript = Transcript(utterances: finished, language: language, speakerCount: speakerCount)
 
             try Task.checkCancellation()
             task.stage = .completed
             historyStore?.save(task: task)
-        } catch is CancellationError {
-            task.stage = .cancelled
         } catch {
-            if task.cancelFlag.isCancelled {
-                task.stage = .cancelled
-            } else {
-                task.stage = .failed(error.localizedDescription)
-            }
+            markFailure(task, error)
         }
+    }
+
+    /// 成功用上字幕返回 true；没有字幕或取字幕出错都返回 false，由调用方继续走转写
+    private func useSubtitlesIfAvailable(
+        for task: TranscriptionTask,
+        into taskDir: URL,
+        settings: AppSettings
+    ) async throws -> Bool {
+        guard settings.preferSubtitles,
+              case let .remote(urlString) = task.source,
+              SubtitleFetcher.isEligible(urlString, hasCookies: settings.cookiesURL != nil) else { return false }
+        task.stage = .fetchingSubtitles
+        let fetched: SubtitleFetcher.Result?
+        do {
+            fetched = try await SubtitleFetcher.fetch(
+                url: urlString,
+                cookiesFile: settings.cookiesURL,
+                destinationDir: taskDir.appendingPathComponent("subs"),
+                maxParts: settings.maxBilibiliParts
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            NSLog("获取字幕失败，改用转写: \(error.localizedDescription)")
+            return false
+        }
+        try Task.checkCancellation()
+        guard let fetched else { return false }
+
+        task.title = fetched.title
+        task.transcript = fetched.transcript.simplifiedChinese()
+        task.transcriptSource = .subtitles
+        task.stage = .completed
+        historyStore?.save(task: task)
+        return true
     }
 
     private func fetchMedia(
         for task: TranscriptionTask,
         into taskDir: URL,
         settings: AppSettings
-    ) async throws -> URL {
+    ) async throws -> (parts: [MediaPart], warning: String?) {
         switch task.source {
         case let .localFile(url):
-            return url
+            return ([MediaPart(label: "", fileURL: url)], nil)
 
         case let .remote(urlString):
             task.stage = .downloading(0)
@@ -163,17 +355,18 @@ final class PipelineCoordinator: ObservableObject {
                     url: url, destinationDir: taskDir, progress: onProgress
                 )
                 task.title = result.title
-                return result.fileURL
+                return ([MediaPart(label: "", fileURL: result.fileURL)], nil)
             }
 
             let result = try await Downloader.download(
                 url: urlString,
                 cookiesFile: settings.cookiesURL,
                 destinationDir: taskDir,
+                maxParts: settings.maxBilibiliParts,
                 progress: onProgress
             )
             task.title = result.title
-            return result.fileURL
+            return (result.parts.isEmpty ? [MediaPart(label: "", fileURL: result.fileURL)] : result.parts, result.warning)
         }
     }
 
